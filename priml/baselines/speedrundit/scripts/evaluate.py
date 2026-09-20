@@ -1,13 +1,22 @@
-"""Planned command-line entry point for generative evaluation.
+"""Small evaluator for generated latent batches."""
 
-This script will eventually:
+from __future__ import annotations
 
-- load a Priml checkpoint or generated sample directory;
-- generate a fixed number of samples with the EMA model when requested;
-- serialize evaluator-compatible sample batches;
-- locate or validate the matching reference batch;
-- invoke the native or explicitly wrapped FID-family evaluator; and
-- write metrics and the resolved evaluation configuration to the run output.
+import argparse
 
-It must remain separate from the fast training and unit-test paths.
-"""
+import torch
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("samples")
+    args = parser.parse_args()
+    samples = torch.load(args.samples, map_location="cpu", weights_only=True)
+    if not isinstance(samples, torch.Tensor) or samples.ndim != 4:
+        raise ValueError("samples must be a rank-4 latent tensor")
+    print({"count": samples.shape[0], "mean": float(samples.mean()), "std": float(samples.std())})
+
+
+if __name__ == "__main__":
+    main()
+

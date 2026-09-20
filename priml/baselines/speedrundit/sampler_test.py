@@ -1,10 +1,13 @@
-"""Tests for SpeedrunDiT latent sampling.
+import torch
 
-Planned coverage:
+from priml.baselines.speedrundit.model_test import _config
+from priml.baselines.speedrundit.sampler import EulerMaruyamaSampler
 
-- deterministic sampling with a fixed seed;
-- sampler step count and endpoint behavior;
-- conditioning and guidance shape contracts;
-- latent-to-image decode shape and range; and
-- evaluator batch serialization without requiring the full ImageNet dataset.
-"""
+
+def test_sampler_preserves_latent_shape() -> None:
+    model = _config().make()
+    sampler = EulerMaruyamaSampler.Config(num_steps=2).make()
+    x = torch.randn(2, 4, 4, 4)
+    result = sampler(model, x, torch.zeros(2, dtype=torch.long), torch.randn(2, 8))
+    assert result.shape == x.shape
+

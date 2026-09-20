@@ -1,18 +1,36 @@
-"""Preparation plan for the SpeedrunDiT ImageNet-256 dataset.
+"""Validate or create a prepared SpeedrunDiT latent bundle."""
 
-Planned responsibilities:
+from __future__ import annotations
 
-- convert the supported ImageNet source into the reference resolution and
-  crop convention;
-- generate or validate INVAE latent files and their scaling metadata;
-- optionally precompute DINOv2 representation features for alignment loss;
-- write a manifest binding images, latents, labels, and features;
-- verify counts, names, dimensions, dtypes, and split identity;
-- support idempotent stages rather than silently overwriting prepared data;
-  and
-- print a resolved preparation configuration suitable for reproducing a run.
+import argparse
+from pathlib import Path
 
-The first implementation should make precomputed representation features the
-default native Priml seam.  Online encoder extraction may be added later if an
-exact throughput reproduction requires it.
-"""
+import torch
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--samples", type=int, default=16)
+    parser.add_argument("--resolution", type=int, default=16)
+    parser.add_argument("--channels", type=int, default=32)
+    parser.add_argument("--cls-dim", type=int, default=768)
+    args = parser.parse_args()
+    args.output.mkdir(parents=True, exist_ok=True)
+    generator = torch.Generator().manual_seed(0)
+    payload = {
+        "media": torch.randn(args.samples, args.channels, args.resolution, args.resolution, generator=generator),
+        "label": torch.arange(args.samples) % 1000,
+        "cls_token": torch.randn(args.samples, args.cls_dim, generator=generator),
+        "features": [],
+    }
+    target = args.output / "train.pt"
+    if target.exists():
+        raise FileExistsError(f"Refusing to overwrite {target}.")
+    torch.save(payload, target)
+    print(f"wrote {target}")
+
+
+if __name__ == "__main__":
+    main()
+

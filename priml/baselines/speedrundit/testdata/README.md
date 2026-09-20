@@ -2,7 +2,10 @@
 
 This directory will contain reviewed, small fixtures rather than ImageNet.
 
-Planned artifacts:
+The repository keeps only small reviewed artifacts here. The portable tests
+exercise synthetic tensors directly; full ImageNet assets do not belong here.
+
+Artifacts:
 
 - `exp000.txt`: Configgle finalized configuration golden;
 - `speedrundit_model_forward.pt`: fixed tiny-model forward golden;

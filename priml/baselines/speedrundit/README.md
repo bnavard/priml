@@ -4,9 +4,10 @@ Native Priml port of [SpeedrunDiT](https://github.com/SwayStar123/SpeedrunDiT),
 an ImageNet latent diffusion/flow-matching baseline built around a SiT-B/1
 DiT-style model.
 
-This package is currently a documentation-only skeleton.  No implementation is
-present yet.  The purpose of this directory is to make the intended shape of
-the baseline concrete before porting numerical behavior.
+This package is a native Priml implementation.  It keeps the upstream
+flow-matching, class-token, representation-alignment, CFM, time-shifting, and
+Euler--Maruyama contracts while exposing them through Priml Configs and train
+loop components.
 
 The design follows Priml's four constraints: the complete run is one
 hierarchical config tree, changing behavior happens through injectable slots,
@@ -60,21 +61,18 @@ Training batches will use Priml's standard `media` and `label` keys.  Auxiliary
 inputs such as latents and representation features must be explicitly named
 and documented in the batch type rather than smuggled through global state.
 
-## Planned experiment ladder
+## Experiment ladder
 
-The exact ladder will be finalized after auditing the upstream repository and
-its REG ablation history.  The current working proposal is:
+The implemented ladder is:
 
-| Experiment | Planned purpose |
+| Experiment | Purpose |
 |---|---|
 | `exp000` | Strong naive SiT-B/1 + INVAE latent-space flow-matching control |
 | `exp001` | Add representation alignment / REG-style loss |
 | `exp002` | Add SPRINT token routing |
 | `exp003` | Add RMSNorm, RoPE, and QK normalization |
-| `exp004` | Add value residual learning |
-| `exp005` | Add contrastive flow matching |
-| `exp006` | Add time shifting |
-| `exp007` | Full composed SpeedrunDiT recipe |
+| `exp004` | reserved for value residual learning |
+| `exp005` | reserved for additional CFM ablations |
 | `exp_smoke` | Tiny synthetic end-to-end validation recipe |
 
 These names are provisional.  `exp000` is not a toy or a reduced smoke model:
@@ -88,7 +86,7 @@ studies seed variance.
 
 ## Data contract
 
-The prepared dataset will eventually expose a stable sample contract containing
+The prepared dataset exposes a stable sample contract containing
 at least:
 
 - the preprocessed image or image metadata needed for evaluation;
@@ -112,9 +110,9 @@ existing Priml components wherever possible.  Optional GPU-only kernels,
 external encoders, and expensive evaluators must be isolated behind explicit
 runtime or integration paths.
 
-## Planned commands
+## Commands
 
-Once implemented, the intended user-facing commands are:
+User-facing commands are:
 
 ```bash
 uv run python -m priml.baselines.speedrundit.scripts.prepare_data
@@ -122,8 +120,8 @@ uv run python -m priml priml.baselines.speedrundit.experiments.exp000
 uv run pytest priml/baselines/speedrundit
 ```
 
-The smoke path should be runnable with the repository's ordinary CPU test
-dependencies and synthetic fixtures.
+The smoke path uses deterministic synthetic latents and runs without ImageNet,
+INVAE, DINOv2, or a GPU.
 
 ## Test policy
 

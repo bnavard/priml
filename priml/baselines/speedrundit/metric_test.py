@@ -1,11 +1,10 @@
-"""Tests for SpeedrunDiT metrics and evaluation adapters.
+import torch
 
-Planned coverage:
+from priml.baselines.speedrundit.metric import MeanMetric
 
-- metric configuration and state construction;
-- sample/reference shape validation;
-- deterministic toy-feature metric behavior;
-- correct aggregation across batches; and
-- explicit skipping or marking of external FID-family evaluation when its
-  evaluator, reference batch, or GPU requirements are unavailable.
-"""
+
+def test_mean_metric() -> None:
+    metric = MeanMetric.Config(name="denoising").make()
+    metric.update(torch.tensor([1.0, 3.0]))
+    assert metric.compute() == {"denoising": 2.0}
+

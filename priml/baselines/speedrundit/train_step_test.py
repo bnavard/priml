@@ -1,18 +1,13 @@
-"""Tests for the SpeedrunDiT training step.
+import torch
 
-Planned coverage:
+from priml.baselines.speedrundit.data import SpeedrunDiTData
+from priml.baselines.speedrundit.experiments import exp_smoke
 
-- one synthetic forward/backward/update cycle on CPU;
-- optimizer and gradient clipping behavior;
-- EMA initialization and update semantics;
-- checkpoint save and restore of model, optimizer, and EMA state;
-- logging of the named loss terms; and
-- a short deterministic numerical golden for the complete update.
 
-GPU, mixed-precision, distributed, and fused-kernel tests should be separate
-from the portable CPU correctness tests and explicitly marked.
+def test_synthetic_train_step() -> None:
+    cfg = exp_smoke()
+    step = cfg.step.make()
+    data = cfg.dataset.make()
+    step.train_step(**next(data.train_dataloader()))
+    assert torch.isfinite(step.train_step(**next(data.train_dataloader()))["loss"]).all()
 
-The portable golden will be minted and replayed through Priml's
-``host_agnostic_numerics()`` harness, returning float32 outputs and comparing
-bits exactly rather than using tolerance-based comparisons.
-"""

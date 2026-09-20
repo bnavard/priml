@@ -1,15 +1,27 @@
-"""Metrics and evaluation adapters for SpeedrunDiT.
+"""Lightweight metrics for training and generated-sample checks."""
 
-Planned responsibilities:
+from __future__ import annotations
 
-- define lightweight training-time metrics such as objective terms and sample
-  counts;
-- define a configuration object for expensive generative evaluation;
-- preserve the upstream reference-batch and sample-batch conventions;
-- report FID, sFID, IS, precision, and recall when the evaluator dependencies
-  and reference data are available; and
-- clearly distinguish smoke metrics from benchmark-quality metrics.
+from configgle import Fig
+from torch import Tensor
 
-Expensive external evaluation must be explicitly marked and must not run in
-the default CPU unit-test tier.
-"""
+
+class MeanMetric:
+    class Config(Fig["MeanMetric"]):
+        name: str = "loss"
+
+    def __init__(self, config: Config) -> None:
+        self.name = config.name
+        self.reset()
+
+    def reset(self) -> None:
+        self.total = 0.0
+        self.count = 0
+
+    def update(self, value: Tensor, **_: object) -> None:
+        self.total += float(value.detach().mean())
+        self.count += 1
+
+    def compute(self) -> dict[str, float]:
+        return {self.name: self.total / self.count if self.count else 0.0}
+

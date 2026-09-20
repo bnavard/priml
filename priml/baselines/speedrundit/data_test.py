@@ -1,16 +1,10 @@
-"""Tests for the SpeedrunDiT prepared-data contract.
+from priml.baselines.speedrundit.data import SpeedrunDiTData
 
-Planned coverage:
 
-- synthetic samples have the documented image, latent, label, and feature
-  shapes;
-- manifest labels and feature files remain aligned;
-- malformed or mismatched samples fail with actionable errors;
-- resolution and latent scaling metadata are validated;
-- dataset iteration is deterministic under a fixed seed; and
-- the dataset can be exercised entirely from temporary test fixtures.
+def test_synthetic_batches_match_contract() -> None:
+    data = SpeedrunDiTData.Config(synthetic=True, num_samples=3, batch_size=2, image_size=4, latent_channels=4, cls_token_dim=8).make()
+    batch = next(data.train_dataloader())
+    assert batch["media"].shape == (2, 4, 4, 4)
+    assert batch["label"].shape == (2,)
+    assert batch["cls_token"].shape == (2, 8)
 
-Tests will shrink only size and resource fields.  They will not substitute a
-different optimizer, loss, schedule, or data semantics merely to make the
-test pass quickly.
-"""
