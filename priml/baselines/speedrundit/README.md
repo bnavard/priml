@@ -1,144 +1,127 @@
 # SpeedrunDiT
 
-Native Priml port of [SpeedrunDiT](https://github.com/SwayStar123/SpeedrunDiT),
-an ImageNet latent diffusion/flow-matching baseline built around a SiT-B/1
-DiT-style model.
+A Priml port of [SpeedrunDiT](https://github.com/SwayStar123/SpeedrunDiT), a
+latent flow-matching transformer that reaches FID 3.49 on ImageNet-256 in
+about 15 H100-hours. `exp000` reproduces the reference exactly; the goldens
+beside it are what keep it reproduced.
 
-This package is a native Priml implementation.  It keeps the upstream
-flow-matching, class-token, representation-alignment, CFM, time-shifting, and
-Euler--Maruyama contracts while exposing them through Priml Configs and train
-loop components.
+Pinned reference: `c24c2ff25699cce63174ca56c2afcfeeb225e367`.
 
-The design follows Priml's four constraints: the complete run is one
-hierarchical config tree, changing behavior happens through injectable slots,
-configuration construction is hermetic, and the finalized tree is printable.
-Anything that affects a result must therefore appear in the config and in the
-experiment's rendered configuration.  Dataset staging, encoder loading, and
-evaluation side effects must not happen during `finalize()`.
+## Running
 
-## Intended scope
+```bash
+uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --synthetic --samples 64
+uv --quiet run --frozen python -m priml priml.baselines.speedrundit.experiments.exp_smoke
+uv --quiet run --frozen python -m priml priml.baselines.speedrundit.experiments.exp000
+uv --quiet run --frozen pytest priml/baselines/speedrundit
+```
 
-The first complete version will target ImageNet-256 and will support:
+`exp000` expects a corpus prepared by the reference's own encoding pipeline:
+ImageNet-256 through INVAE (f16, 32 channels) for the latents, and DINOv2
+ViT-B/14 for the alignment targets. Neither encoder is reimplemented here.
+`prepare_data --verify` checks a tree against the layout the loader reads;
+`prepare_data --synthetic` writes that same layout with random tensors, which
+is what lets the smoke experiment and every loader test run with no ImageNet.
 
-1. prepared ImageNet images, INVAE latents, class labels, and representation
-   features;
-2. a configurable SiT-B/1-style latent transformer;
-3. velocity prediction on a linear flow path;
-4. representation-alignment, denoising, class, and contrastive flow-matching
-   loss terms;
-5. EMA training and checkpointing;
-6. latent sampling and INVAE decoding;
-7. reference-compatible FID-family evaluation; and
-8. a small synthetic smoke experiment that runs without external data.
-
-The implementation will use Priml's configuration, train-loop, distributed
-runtime, checkpointing, model, loss, and diffusion abstractions.  The upstream
-repository is the behavioral and numerical reference, not a dependency to be
-imported wholesale.
-
-## Priml boundaries
-
-The package will keep behavior local until a second caller or a clearly
-general primitive justifies promotion into `priml/`:
-
-- `data.py` owns disk-backed input and preparation metadata;
-- `model.py` owns stateful neural modules and their Configs;
-- `loss.py` owns configgleable objective composition, while broadly reusable
-  pure diffusion math belongs in `priml/math/diffusion`;
-- `train_step.py` owns run-time optimization, RNG, and train-step state;
-- `sampler.py` owns inference-time generation and decoding;
-- `metric.py` owns stateful metric accumulation;
-- `experiments.py` owns only dataset-specific recipe assembly; and
-- tests and `testdata/` remain test-only and are never imported by production.
-
-The implementation will use Priml's blessed names such as `channels_in`,
-`channels_out`, `channels_hidden`, `heads`, `norm`, `norm_qk`, `norm_out`,
-`device`, `dtype`, `working_dir`, `max_steps`, and `seed`.  It will prefer
-Config or callable slots over mode strings, enum-like flags, hidden sentinels,
-module globals, and environment reads.
-
-Training batches will use Priml's standard `media` and `label` keys.  Auxiliary
-inputs such as latents and representation features must be explicitly named
-and documented in the batch type rather than smuggled through global state.
-
-## Experiment ladder
-
-The implemented ladder is:
+## Experiments
 
 | Experiment | Purpose |
 |---|---|
-| `exp000` | Strong naive SiT-B/1 + INVAE latent-space flow-matching control |
-| `exp001` | Add representation alignment / REG-style loss |
-| `exp002` | Add SPRINT token routing |
-| `exp003` | Add RMSNorm, RoPE, and QK normalization |
-| `exp004` | reserved for value residual learning |
-| `exp005` | reserved for additional CFM ablations |
-| `exp_smoke` | Tiny synthetic end-to-end validation recipe |
+| `exp000` | SR-DiT-B/1 reproducing the pinned reference |
+| `exp_smoke` | The same recipe at a size that runs on a laptop CPU |
 
-These names are provisional.  `exp000` is not a toy or a reduced smoke model:
-it is the strongest straightforward recipe that uses no SpeedrunDiT-specific
-exotica.  Each published experiment must have a clear named parent, one
-attributable change, a hypothesis, references, and measured results.  An
-optimizer and the schedule it prescribes may count as one inseparable change;
-otherwise the fork must change one config path.  `exp000` will be frozen once
-its recipe is established.  `seed` remains at its default unless an experiment
-studies seed variance.
+`exp000` is a parity port, not the "best naive recipe" the usual `exp000`
+contract asks for. That is a deliberate, argued departure: the baseline exists
+to show Priml's components compute the published model exactly, so the control
+has to be the published model — SPRINT routing, value residuals, rotary
+positions and all. Once parity holds, a later fork can strip one of them and
+measure what it earned.
 
-## Data contract
+## Bit-for-bit parity
 
-The prepared dataset exposes a stable sample contract containing
-at least:
+Four things are pinned to the reference, and `scripts/parity.py` measures each
+against a fresh clone at the commit above:
 
-- the preprocessed image or image metadata needed for evaluation;
-- an INVAE latent with fixed channel and spatial dimensions;
-- an ImageNet class label; and
-- representation-alignment features, initially planned to be precomputed.
-
-The upstream dataset uses `images/` and `vae-in/` trees plus a label manifest.
-The Priml preparation layer will document and validate this format rather than
-silently accepting mismatched files.
-
-Experiment construction must never download data, inspect the dataset, or load
-model weights.  Preparation and heavyweight encoder work belong in the script
-or dataset runtime, not in `experiments.py`.
-
-## Dependency policy
-
-The port will not copy the upstream `requirements.txt`.  Priml currently has
-its own supported Python and PyTorch versions, and the baseline should reuse
-existing Priml components wherever possible.  Optional GPU-only kernels,
-external encoders, and expensive evaluators must be isolated behind explicit
-runtime or integration paths.
-
-## Commands
-
-User-facing commands are:
+| Checkpoint | How it is compared |
+|---|---|
+| Data loading | Both loaders over one synthetic tree in the reference's layout; order, labels, latents and images compared with `torch.equal` |
+| Initialization | Same seed, same geometry; every parameter compared positionally |
+| Forward and objective | Fixed inputs; every named loss term compared |
+| Five optimizer steps | Loss, drawn times, drawn noise, every gradient, and every post-step weight |
 
 ```bash
-uv run python -m priml.baselines.speedrundit.scripts.prepare_data
-uv run python -m priml priml.baselines.speedrundit.experiments.exp000
-uv run pytest priml/baselines/speedrundit
+uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.parity
 ```
 
-The smoke path uses deterministic synthetic latents and runs without ImageNet,
-INVAE, DINOv2, or a GPU.
+The script needs a network and a git clone, so it is not a unit test. It
+establishes the port once against a moving upstream; the goldens under
+`testdata/` freeze it afterwards and run on CPU in the ordinary suite.
 
-## Test policy
+Two structural differences are **reported rather than normalized away**:
 
-Portable tests must run on CPU and stay below 100 ms by shrinking depth, width,
-batch size, and step count without changing the recipe.  They must not replace
-the real optimizer, schedule, loss, initialization, or model behavior merely
-to make a test fast.
+- Value-residual parameters are `attn.value_residual.weight` here and
+  `attn.v1_lambda` upstream, so parameters are compared by position, which is
+  what construction order makes the honest key anyway.
+- Priml's `EMA` declines to average tensors with `requires_grad=False`
+  (`priml/train/ema.py:502`), while the reference's `update_ema` walks every
+  `named_parameter` and therefore lerps the frozen `pos_embed` — and
+  `p * 0.9999 + p * 0.0001` is not `p` in float32, so its shadow drifts by
+  rounding. Model weights are unaffected; the EMA shadow is not compared.
 
-The experiment suite will use Configgle's public
-`configgle.testing.assert_pprint_golden` for finalized configuration goldens.
-Model and optimizer behavior will use Priml's bit-for-bit golden harness inside
-`host_agnostic_numerics()`, with `.float()` outputs and exact bit comparison.
-Goldens must be deliberately perturbed once to verify that they fail before
-being trusted.
+### Why some of `priml.math.diffusion` is not on the training path
 
-## Upstream reference
+The schedule family there is parameterized on log-SNR:
+`log_snr_from_log_time_per_logit` maps `t` through a logit and
+`log_sigma_from_log_snr_per_rectified_flow` maps back through a sigmoid, so
+recovering `sigma` costs a round trip. The reference writes `alpha = 1 - t`
+and `sigma = t` directly. The two agree far below a float32 ULP and are not
+bit-identical, and this baseline's contract is exact parity, so the
+interpolant stays in time space in `loss.py`. `target_rectified_flow`'s own
+target, `eps - x`, *is* reproduced exactly by the linear path's `-1 * x + 1 * eps`.
 
-The port is based on the public SpeedrunDiT repository and must preserve its
-attribution, license obligations, model semantics, latent scaling, loss
-definitions, sampling conventions, and evaluation protocol.
+`priml.math.diffusion.sample` is not used by `sampler.py` for a structural
+reason rather than a numerical one: it threads a single state tensor, and this
+model diffuses a latent and a class token jointly on a shared time grid.
+
+## Layout
+
+| File | Owns |
+|---|---|
+| `data.py` | The prepared corpus, the shuffle stream, and resume |
+| `model.py` | Every module and its Config |
+| `loss.py` | The four-term objective and the path functions it injects |
+| `train_step.py` | One optimizer update |
+| `sampler.py` | Euler–Maruyama generation |
+| `metric.py` | Held-out velocity error |
+| `experiments.py` | Recipe assembly only |
+| `scripts/prepare_data.py` | Staging; never imported by a config |
+| `scripts/parity.py` | The upstream comparison; never imported by the library |
+
+## Testing
+
+Portable tests run on CPU and shrink depth, width, batch and step count
+without touching the recipe. Two things are deliberately **not** shrunk:
+
+- `heads` stays at four. Two heads make the head axis and the batch axis the
+  same length at the test batch size, which would hide a transpose.
+- The SPRINT split keeps two encoder and two decoder layers around at least
+  one sparse layer. A shorter trunk drops the sparse stage entirely and stops
+  covering the routing, the mask token, and the fusion projection.
+
+Regenerating goldens:
+
+```bash
+CONFIGGLE_REGENERATE_GOLDEN=1 uv --quiet run --frozen pytest priml/baselines/speedrundit/experiments_test.py
+BFB_REGENERATE=1 uv --quiet run --frozen pytest priml/baselines/speedrundit/bfb_test.py
+```
+
+A missing bit-for-bit golden is minted **and still fails**, which is what
+forces someone to read it before the next run accepts it. Regenerating one
+means the recipe changed.
+
+## Attribution
+
+SpeedrunDiT is MIT-licensed. The model derives from SiT and DiT, the rotary
+implementation from EVA-02, and the position table from MAE; the alignment
+term is REPA and the contrastive term is Contrastive Flow Matching. See the
+module docstrings for citations.

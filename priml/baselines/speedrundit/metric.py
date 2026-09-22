@@ -1,27 +1,115 @@
-"""Lightweight metrics for training and generated-sample checks."""
+"""Evaluation metric for SR-DiT: mean velocity error over the eval corpus.
+
+Deliberately not FID. A distributional score needs a full sampling pass, an
+INVAE decode, and a 50k reference batch, none of which belong inside the train
+loop's eval cadence; that lives in ``scripts/`` and is run against a
+checkpoint. What this metric answers is the question an eval every ten
+thousand steps should answer -- is the velocity field still improving on held-
+out latents -- at the cost of one forward.
+
+The per-sample error arrives as the step's ``model`` output rather than as
+logits, which is what a generative recipe has instead of class scores. Padding
+rows are excluded by ``valid_count`` rather than averaged in as zeros, which
+would otherwise pull the mean toward zero in proportion to how short the final
+batch was.
+"""
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING, TypedDict, cast
+
+import torch
+import torch.distributed as dist
 
 from configgle import Fig
 from torch import Tensor
 
+from priml.lib.custom_json import FloatCodec
 
-class MeanMetric:
-    class Config(Fig["MeanMetric"]):
-        name: str = "loss"
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+
+__all__ = ["VelocityError"]
+
+
+class VelocityError:
+    """Accumulates the mean per-sample velocity error."""
+
+    class Config(Fig["VelocityError"]):
+        """Configuration for VelocityError."""
+
+        key: str = "mse"
+        """Name the computed value is published under."""
+
+    class StateDict(TypedDict):
+        """Checkpoint payload."""
+
+        total: float
+        count: int
 
     def __init__(self, config: Config) -> None:
-        self.name = config.name
-        self.reset()
+        self.key = config.key
+        self._total = 0.0
+        self._count = 0
+
+    def update(self, logits: Tensor, **batch: object) -> None:
+        """Accumulate one batch.
+
+        Args:
+          logits: Per-sample velocity error, ``[batch]``.
+          **batch: The full batch; ``valid_count`` is read when present.
+
+        """
+        valid = batch.get("valid_count")
+        errors = logits.detach().flatten()
+        rows = int(valid) if isinstance(valid, int) else errors.numel()
+        rows = min(rows, errors.numel())
+        if rows <= 0:
+            return
+        self._total += float(errors[:rows].sum())
+        self._count += rows
+
+    def compute(self) -> Mapping[str, object]:
+        """Reduce across ranks and report the mean.
+
+        Returns:
+          metrics: The mean velocity error, or zero when nothing was seen.
+
+        """
+        counts = torch.tensor([self._total, float(self._count)], dtype=torch.float64)
+        if dist.is_available() and dist.is_initialized():
+            # NCCL reduces only CUDA tensors; gloo only CPU ones. Move for the
+            # former and come back, so ``.tolist()`` works either way.
+            if dist.get_backend() != "gloo":
+                counts = counts.to(torch.device("cuda", torch.cuda.current_device()))
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+            counts = counts.cpu()
+        total, count = (FloatCodec.coerce(value) for value in counts.tolist())
+        return {self.key: total / count if count else 0.0}
 
     def reset(self) -> None:
-        self.total = 0.0
-        self.count = 0
+        """Discard accumulated state."""
+        self._total = 0.0
+        self._count = 0
 
-    def update(self, value: Tensor, **_: object) -> None:
-        self.total += float(value.detach().mean())
-        self.count += 1
+    def state_dict(self) -> StateDict:
+        """Capture accumulated state.
 
-    def compute(self) -> dict[str, float]:
-        return {self.name: self.total / self.count if self.count else 0.0}
+        Returns:
+          state: The running sum and count.
 
+        """
+        return {"total": self._total, "count": self._count}
+
+    def load_state_dict(self, state_dict: Mapping[str, object]) -> None:
+        """Restore accumulated state.
+
+        Args:
+          state_dict: A payload from :meth:`state_dict`.
+
+        """
+        state = cast(VelocityError.StateDict, state_dict)
+        self._total = state["total"]
+        self._count = state["count"]
