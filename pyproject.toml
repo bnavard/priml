@@ -28,6 +28,7 @@ dependencies = [
     # media
     "imageio-ffmpeg>=0.6.0",
     "imagesize>=1.4",
+    "opencv-contrib-python-headless>=5.0.0.93",
     "pygame-ce>=2.5.8",
     # On 24.04 LTS, package libturbojpeg is too old.
     #   R=libjpeg-turbo/libjpeg-turbo/releases
@@ -101,7 +102,7 @@ typecheck = [
     "basedpyright>=1.40.1",
     "ty>=0.0.82",
     "rekursiv-ai-typeshed",
-    "hatchling>=1.32.1",  # packages/rekursiv-ai-typeshed/rekursiv_ai_typeshed/hatch_build.py subscripts its two-parameter BuildHookInterface.
+    "hatchling>=1.32.4",  # packages/rekursiv-ai-typeshed/rekursiv_ai_typeshed/hatch_build.py subscripts its one-parameter BuildHookInterface.
     "safetensors",
 ]
 "pre-commit" = [

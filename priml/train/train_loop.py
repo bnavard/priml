@@ -121,7 +121,7 @@ class TrainLoop:
     Example:
       cfg = TrainLoop.Config(
           step=TrainStep.Config(...),
-          dataset=ImageNetDataset.Config(...),
+          dataset=ImageNetData.Config(...),
           metrics_eval={"accuracy": TopK.Config(k_values=[1, 5])},
       )
       loop = cfg.make()
@@ -323,6 +323,7 @@ class TrainLoop:
         self.tracker: TrackerProtocol | None = None
         self.profiler: ProfilerProtocol | None = None
         self._gc_disabled = False
+        self._closed = False
         self._training = False
         self._terminal_epoch_evaluated = False
         self._last_boundary_epoch = 0
@@ -420,7 +421,7 @@ class TrainLoop:
             self.profiler = config.profiler.make() if config.profiler else None
             logger.info("TrainLoop startup: profiler ready.")
 
-            if math.isfinite(config.num_steps_garbage_collect):
+            if math.isfinite(config.num_steps_garbage_collect) and gc.isenabled():
                 gc.disable()
                 self._gc_disabled = True
 
@@ -445,7 +446,14 @@ class TrainLoop:
             raise
 
     def train(self) -> None:
-        """Run step-based training loop."""
+        """Run step-based training loop.
+
+        Raises:
+          RuntimeError: If this loop has already been closed.
+
+        """
+        if self._closed:
+            raise RuntimeError("Cannot train a closed TrainLoop.")
         self._training = True
         self._last_boundary_epoch = self.current_epoch
         try:
@@ -965,8 +973,21 @@ class TrainLoop:
         if not is_final:
             self._last_eval_step = self.step.global_step
 
+    def close(self) -> None:
+        """Release a constructed loop that has not entered ``train()``.
+
+        Raises:
+            RuntimeError: The loop is actively training.
+
+        """
+        if self._training:
+            raise RuntimeError("Cannot close a TrainLoop while train() is active.")
+        self._cleanup()
+
     def _cleanup(self) -> None:
         """Cleanup resources after training."""
+        if self._closed:
+            return
         actions: list[Callable[[], object]] = []
         if self.checkpointer is not None:
             actions.append(self.checkpointer.close)
@@ -978,7 +999,10 @@ class TrainLoop:
             actions.append(gc.enable)
             self._gc_disabled = False
         actions.append(self._destroy_runtime_once)
-        _finish_resources(actions)
+        try:
+            _finish_resources(actions)
+        finally:
+            self._closed = True
 
     def _destroy_runtime_once(self) -> None:
         """Tear down an owned runtime, at most once."""
@@ -1068,7 +1092,7 @@ class TrainLoop:
         total_step_metrics: dict[str, float] = {}
         num_batches = 0
         total_weight = 0
-        total_batches = len(eval_loader) if isinstance(eval_loader, Sized) else 0
+        total_batches = _loader_length(eval_loader)
         narrate = is_rank_zero()
         log_every = max(1, total_batches // 20) if total_batches else 50
 
@@ -1302,6 +1326,19 @@ class _SupportsBindEpochTimer(Protocol):
     """
 
     def bind_epoch_timer(self, timer: CheckpointableStepTimer) -> None: ...
+
+
+# ``DataLoader`` defines ``__len__`` unconditionally, so it passes a ``Sized`` check
+# even over an ``IterableDataset`` without a length -- whose ``len`` then raises
+# ``TypeError``.
+def _loader_length(loader: object) -> int:
+    """Return the loader's batch count, or 0 when it has none."""
+    if not isinstance(loader, Sized):
+        return 0
+    try:
+        return len(loader)
+    except TypeError:
+        return 0
 
 
 def _set_loader_epoch(loader: object, epoch: int) -> None:

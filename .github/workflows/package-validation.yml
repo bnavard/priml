@@ -31,7 +31,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - name: Cache apt packages
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -49,10 +49,11 @@ jobs:
         run: |
           # Lint/type/test checks come from this package's own .pre-commit-config.yaml.
           # Restating each tool here means a newly added hook silently goes unrun.
+          bash install-libjpeg-turbo.sh
           uv sync --frozen --all-groups
           uv run pre-commit run --all-files --hook-stage pre-commit
           uv run pre-commit run --all-files --hook-stage pre-push
           uv run python -c "import priml"
           rm -rf dist
           uv build --out-dir dist
-          wheels=(dist/priml-*.whl); wheel="${wheels[0]}"; uv run --isolated --with "$wheel" --with "configgle @ git+https://github.com/rekursiv-ai/configgle" python -P -c "import priml; print(priml.__file__)"
+          wheels=(dist/priml-*.whl); wheel="${wheels[0]}"; uv run --isolated --index https://download.pytorch.org/whl/cpu --index-strategy unsafe-best-match --with "$wheel" --with "configgle @ git+https://github.com/rekursiv-ai/configgle" python -P -c "import priml; print(priml.__file__)"
