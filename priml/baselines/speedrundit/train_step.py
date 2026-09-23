@@ -11,6 +11,7 @@ it stands, and the ``with self.timer_step:`` bracket is what advances
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from dataclasses import field
 from typing import TYPE_CHECKING, cast, override
@@ -22,15 +23,16 @@ import torch
 
 from priml.baselines.speedrundit.loss import SpeedrunDiTLoss
 from priml.baselines.speedrundit.model import SpeedrunDiT
+from priml.train.custom_types import EMAProtocol
 from priml.train.ema import EMA
 from priml.train.grad_clip import clip_grad_norm_
 from priml.train.train_step import TrainStep
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import Generator
 
-    from priml.train.custom_types import EMAProtocol, TrainStepOutput
+    from priml.train.custom_types import TrainStepOutput
 
 
 __all__ = ["SpeedrunDiTTrainStep"]

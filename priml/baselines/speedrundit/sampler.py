@@ -1,51 +1,111 @@
 """Generation: integrate the learned velocity from noise back to data.
 
-The step is :func:`priml.math.diffusion.ddpm_ddim` at its own defaults -- this
-model predicts ``v = eps - x``, which is what ``target_rectified_flow``
-decomposes, and rectified flow is already that function's partner corruption.
-``eta`` chooses between a deterministic DDIM trajectory and the full DDPM
-posterior.
+The reference's own sampler, ``euler_maruyama_sampler_path_drop`` at the pinned
+commit -- the one its FID is measured with. Euler--Maruyama over the reverse
+SDE ``dx = [v - g(t)^2 / 2 * score] dt + g(t) dW``, with the score recovered
+from the predicted velocity through the SAME path the objective trained on,
+and a final deterministic step that lands on ``t = 0``.
 
-What is written here is the loop, because this model carries two coupled
+Not :func:`priml.math.diffusion.ddpm_ddim`. That is the DDPM posterior step,
+which discretizes the reverse SDE whose diffusion is ``2t / (1 - t)`` under
+the straight path, where this one's is ``2t``: both sample the same marginals
+in the continuous limit, and at any finite step count they are different
+samplers producing different images. Reproducing the reported numbers needs
+this one, and ``math.diffusion`` carries no Euler--Maruyama step, nor a score
+recovered from a velocity under an arbitrary path.
+
+What is written here is also the loop, because this model carries two coupled
 streams: the latent and the class token share a time grid and each feeds the
-other's velocity, so they advance together. Time is carried as ``log_snr`` and
-handed back to the model as ``t`` through the schedule's stated inverse.
+other's velocity, so they advance together.
 
 References:
-  https://arxiv.org/abs/2010.02502
-    Song et al. 2020, "Denoising Diffusion Implicit Models" (the eta family).
+  https://github.com/SwayStar123/SpeedrunDiT
+    ``samplers.py``, pinned at c24c2ff25699cce63174ca56c2afcfeeb225e367.
   https://arxiv.org/abs/2401.08740
     Ma et al. 2024, "SiT", Section 4 on SDE sampling.
+  https://arxiv.org/abs/2410.06940
+    Yu et al. 2024, "REPA", whose sampler this is.
+  https://arxiv.org/abs/2510.21986
+    Park et al. 2025, "SPRINT", whose path-drop guidance the weak branch is.
+
 """
 
 from __future__ import annotations
 
-from dataclasses import KW_ONLY
-from typing import TYPE_CHECKING, NamedTuple
+from dataclasses import KW_ONLY, field
+from typing import TYPE_CHECKING, NamedTuple, Self, override
+
+from configgle import Fig, Makeable, PartialConfig
+from torch import Tensor
 
 import torch
 
-from configgle import Fig
-
-from priml.baselines.speedrundit.loss import resolution_time_shift
-from priml.math.diffusion import (
-    TargetFn,
-    ddpm_ddim,
-    log_sigma_from_log_snr_per_rectified_flow,
-    log_snr_from_log_time_per_logit,
-    log_time_from_log_snr_per_logit,
-    target_rectified_flow,
+from priml.baselines.speedrundit.loss import (
+    InterpolantFn,
+    TimeTransformFn,
+    as_callable,
+    linear_path,
+    resolution_time_shift,
 )
+from priml.math.custom_types import TensorFn
 
 
 if TYPE_CHECKING:
-    from torch import Tensor
-
     from priml.baselines.speedrundit.model import SpeedrunDiT
-    from priml.math.custom_types import TensorableFn
 
 
-__all__ = ["EulerMaruyamaSampler"]
+__all__ = ["EulerMaruyamaSampler", "repa_diffusion", "velocity_to_score"]
+
+
+def repa_diffusion(t: Tensor) -> Tensor:
+    """Squared diffusion coefficient ``g(t)^2 = 2t`` of the reference's SDE.
+
+    Args:
+      t: Flow times.
+
+    Returns:
+      diffusion: ``2 * t``.
+
+    """
+    return 2 * t
+
+
+def velocity_to_score(
+    velocity: Tensor,
+    state: Tensor,
+    path: InterpolantFn,
+    t: Tensor,
+) -> Tensor:
+    """Recover the score of ``p_t`` from a predicted velocity.
+
+    Args:
+      velocity: Predicted ``d x_t / d t``.
+      state: The noisy sample ``x_t``.
+      path: The probability path the velocity was trained against.
+      t: Flow times, broadcastable to ``state``.
+
+    Returns:
+      score: ``grad log p_t(x_t)``, shaped like ``state``.
+
+    Derivation:
+      With ``x_t = alpha x + sigma eps``, the velocity is
+      ``v = d_alpha x + d_sigma eps`` and the score is ``-E[eps | x_t] / sigma``.
+      Eliminating ``x`` between the two with ``r = alpha / d_alpha``,
+
+          r v - x_t = (r d_sigma - sigma) eps
+
+      so ``E[eps | x_t] = (r v - x_t) / (r d_sigma - sigma)`` and
+
+          score = (r v - x_t) / (sigma^2 - r d_sigma sigma).
+
+      Spelled exactly as the reference spells it; a rearrangement lands on
+      different last bits.
+
+    """
+    coefficients = path(t)
+    ratio = coefficients.alpha / coefficients.d_alpha
+    variance = coefficients.sigma**2 - ratio * coefficients.d_sigma * coefficients.sigma
+    return (ratio * velocity - state) / variance
 
 
 class EulerMaruyamaSampler:
@@ -66,71 +126,69 @@ class EulerMaruyamaSampler:
         _: KW_ONLY
 
         num_steps: int = 250
-        """Integration steps; the reported FID is measured at this count."""
+        """Model evaluations per stream; the reported FID is measured at 250."""
 
         last_time: float = 0.04
-        """Time the grid stops at. Zero is unreachable: ``log_snr`` there is
-        infinite, and the drift is stiffest in the last steps anyway."""
+        """Where the stochastic steps stop. One deterministic step then lands
+        on zero, where the diffusion ``2t`` would otherwise inject noise."""
 
-        eta: float = 1.0
-        """Stochasticity: zero is DDIM, one is the DDPM posterior."""
+        interpolant: InterpolantFn = linear_path
+        """The path the score is recovered through; the objective's own."""
 
-        target_fn: TargetFn = target_rectified_flow
-        """Decomposes the model output into clean signal and noise.
+        time_transform: Makeable[TimeTransformFn] | TimeTransformFn | None = field(
+            default_factory=lambda: PartialConfig(resolution_time_shift, base=4096),
+        )
+        """Reparameterizes the time grid; ``None`` leaves it uniform. Must
+        match the objective's, or the sampler walks a curve the model was
+        never fit to."""
 
-        Must agree with what the model was trained to predict; this one reads
-        a velocity, which is what the objective's default path targets."""
-
-        corruption_fn: TensorableFn = log_sigma_from_log_snr_per_rectified_flow
-        """Maps log SNR to log sigma; the path's own corruption rule."""
-
-        time_shift_base: int | None = 4096
-        """Element count at which the time shift is the identity; ``None``
-        disables shifting. Must match the objective's, or the sampler walks a
-        curve the model was never fit to."""
+        diffusion: TensorFn = repa_diffusion
+        """Squared diffusion coefficient ``g(t)^2`` of the reverse SDE."""
 
         guidance: float = 1.0
-        """Classifier-free guidance strength; one disables the second pass."""
+        """Guidance strength on both streams; guidance runs only above one.
 
-        @property
-        def uses_guidance(self) -> bool:
-            """Whether an unconditional pass is needed.
+        The reference exposes a separate class-token strength, and every
+        published invocation sets it equal to this one."""
 
-            Returns:
-              needed: True when ``guidance`` is not exactly one.
+        guidance_interval: tuple[float, float] = (0.0, 1.0)
+        """Times, inclusive, at which guidance applies."""
 
-            """
-            return self.guidance != 1.0
+        @override
+        def finalize(self) -> Self:
+            if self.num_steps < 1:
+                raise ValueError(f"num_steps must be positive; got {self.num_steps}.")
+            if not 0.0 < self.last_time < 1.0:
+                raise ValueError(f"last_time must be in (0, 1); got {self.last_time}.")
+            return super().finalize()
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        self.time_transform: TimeTransformFn | None = (
+            None
+            if config.time_transform is None
+            else as_callable(config.time_transform)
+        )
 
-    def log_snr(self, shape: tuple[int, ...], device: torch.device) -> Tensor:
-        """Build the descending log-SNR grid.
+    def times(self, shape: tuple[int, ...]) -> Tensor:
+        """Build the descending time grid.
+
+        Float64 and on the CPU, as the reference builds it: every step's
+        ``dt`` and noise scale are read off this grid.
 
         Args:
-          shape: Shape of one sample, without the batch axis.
-          device: Device the grid is built on.
+          shape: Shape of one latent, without the batch axis.
 
         Returns:
-          log_snr: ``[num_steps + 1]``, increasing as time descends.
+          times: ``[num_steps + 1]``, from one down to exactly zero.
 
         """
         cfg = self.config
-        times = torch.linspace(
-            1.0,
-            cfg.last_time,
-            cfg.num_steps,
-            dtype=torch.float64,
-            device=device,
-        )
-        if cfg.time_shift_base is not None:
-            times = resolution_time_shift(
-                times,
-                shape=shape,
-                base=cfg.time_shift_base,
-            )
-        return log_snr_from_log_time_per_logit(times.log())
+        grid = torch.linspace(1.0, cfg.last_time, cfg.num_steps, dtype=torch.float64)
+        grid = torch.cat([grid, grid.new_zeros(1)])
+        if self.time_transform is not None:
+            grid = self.time_transform(grid, shape=shape)
+        return grid
 
     @torch.no_grad()
     def __call__(
@@ -143,107 +201,120 @@ class EulerMaruyamaSampler:
         """Integrate from noise to data.
 
         Args:
-          model: The trained velocity field.
+          model: The trained velocity field, in eval mode.
           media: Initial latent noise, ``[batch, channels, size, size]``.
           label: Class indices to condition on, ``[batch]``.
           cls_token: Initial class-token noise, ``[batch, channels_cls]``.
 
         Returns:
-          output: The integrated latent and class token.
+          output: The integrated latent and class token, in their input dtypes.
+
+        Raises:
+          ValueError: If the model is training, whose label dropout and token
+            routing would be sampled from; or if guidance is asked of a model
+            built without the null class.
 
         """
-        grid = self.log_snr(tuple(media.shape[1:]), media.device)
-        latent, cls = media, cls_token
-        steps = grid.shape[0] - 1
-
-        for index in range(steps):
-            curr, following = grid[index], grid[index + 1]
-            time = self._times(curr, latent.shape[0], latent.dtype, latent.device)
-            velocity, velocity_cls = self._velocity(model, latent, time, label, cls)
-            # The final step takes the posterior mean and adds no noise, as
-            # Ho et al. prescribe; every earlier one is stochastic.
-            noisy = index < steps - 1
-            latent = self._advance(velocity, latent, curr, following, noisy=noisy)
-            cls = self._advance(velocity_cls, cls, curr, following, noisy=noisy)
-        return EulerMaruyamaSampler.Output(media=latent, cls_token=cls)
-
-    def _advance(
-        self,
-        velocity: Tensor,
-        state: Tensor,
-        log_snr_curr: Tensor,
-        log_snr_next: Tensor,
-        *,
-        noisy: bool,
-    ) -> Tensor:
-        """Take one shared diffusion step.
-
-        Args:
-          velocity: The model's prediction for this stream.
-          state: Current noisy state.
-          log_snr_curr: Log SNR now.
-          log_snr_next: Log SNR after the step.
-          noisy: Whether to add the step's sampling noise.
-
-        Returns:
-          state: The advanced state.
-
-        """
-        cfg = self.config
-        _, mean, log_std = ddpm_ddim(
-            velocity,
-            state,
-            log_snr_curr,
-            log_snr_next,
-            corruption_fn=cfg.corruption_fn,
-            target_fn=cfg.target_fn,
-            eta=cfg.eta,
+        if model.training:
+            raise ValueError("Sample from a model in eval mode.")
+        null = None
+        if self.config.guidance > 1.0:
+            labels = model.y_embedder
+            if labels.dropout <= 0:
+                raise ValueError(
+                    "Guidance needs the null class, which dropout 0 omits.",
+                )
+            null = torch.full_like(label, labels.num_classes)
+        grid = self.times(tuple(media.shape[1:]))
+        # Carried in float64 and handed to the model in its own dtype, as the
+        # reference does, so the accumulation over hundreds of steps is not
+        # the model's precision.
+        latent, cls = media.to(torch.float64), cls_token.to(torch.float64)
+        last = grid.shape[0] - 2
+        for index in range(last + 1):
+            t_curr, t_next = grid[index], grid[index + 1]
+            drift, drift_cls = self._drift(
+                model,
+                latent,
+                cls,
+                t_curr=t_curr,
+                label=label,
+                null=null,
+                dtype=media.dtype,
+            )
+            dt = t_next - t_curr
+            if index == last:
+                latent = latent + dt * drift
+                cls = cls + dt * drift_cls
+                break
+            # Drawn after the forwards, latent before class, as the reference
+            # draws them; the model draws nothing in eval.
+            noise = torch.randn_like(latent) * torch.sqrt(torch.abs(dt))
+            noise_cls = torch.randn_like(cls) * torch.sqrt(torch.abs(dt))
+            scale = torch.sqrt(self.config.diffusion(t_curr))
+            latent = latent + drift * dt + scale * noise
+            cls = cls + drift_cls * dt + scale * noise_cls
+        return EulerMaruyamaSampler.Output(
+            media=latent.to(media.dtype),
+            cls_token=cls.to(cls_token.dtype),
         )
-        if not noisy:
-            return mean
-        return mean + torch.exp(log_std) * torch.randn_like(state)
 
-    def _times(
-        self,
-        log_snr: Tensor,
-        batch: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> Tensor:
-        """Recover the flow time the model was conditioned on."""
-        time = log_time_from_log_snr_per_logit(log_snr).exp()
-        return torch.full((batch,), float(time), dtype=dtype, device=device)
-
-    def _velocity(
+    def _drift(
         self,
         model: SpeedrunDiT,
-        media: Tensor,
-        time: Tensor,
+        latent: Tensor,
+        cls: Tensor,
+        *,
+        t_curr: Tensor,
         label: Tensor,
-        cls_token: Tensor,
+        null: Tensor | None,
+        dtype: torch.dtype,
     ) -> tuple[Tensor, Tensor]:
-        """Evaluate both velocities, optionally with guidance.
+        """Evaluate both streams' drifts at one time, guided when asked.
+
+        Guidance mixes DRIFTS, not velocities, and its weak branch is the
+        null class with the sparse path dropped -- two forwards, not one
+        doubled batch, because the branches take different routes.
 
         Args:
           model: The trained velocity field.
-          media: Current latents.
-          time: Current times.
+          latent: Current latents, float64.
+          cls: Current class token, float64.
+          t_curr: Current time, a float64 scalar.
           label: Class indices.
-          cls_token: Current class token.
+          null: The null class per sample, or ``None`` when unguided.
+          dtype: The model's input dtype.
 
         Returns:
-          velocity: Latent velocity.
-          velocity_cls: Class-token velocity.
+          drift: Latent drift, float64.
+          drift_cls: Class-token drift, float64.
 
         """
-        conditional = model(media, time, label, cls_token)
-        if not self.config.uses_guidance:
-            return conditional.velocity, conditional.cls_velocity
-        # Two forwards, not one doubled batch: the unconditional branch also
-        # discards the sparse path, so the two take different routes.
-        unconditional = model(media, time, label, cls_token, uncond=True)
-        weight = self.config.guidance
+        cfg = self.config
+        low, high = cfg.guidance_interval
+        guided = null is not None and low <= float(t_curr) <= high
+        batch = latent.shape[0]
+        time = torch.ones(batch, dtype=torch.float64, device=latent.device) * t_curr
+        diffusion = cfg.diffusion(t_curr)
+
+        def drift(velocity: Tensor, state: Tensor) -> Tensor:
+            velocity = velocity.to(torch.float64)
+            t = time.view(-1, *[1] * (state.ndim - 1))
+            score = velocity_to_score(velocity, state, cfg.interpolant, t)
+            return velocity - 0.5 * diffusion * score
+
+        inputs = (latent.to(dtype), time.to(dtype))
+        strong = model(*inputs, label, cls.to(dtype))
+        drift_strong = drift(strong.velocity, latent)
+        drift_strong_cls = drift(strong.cls_velocity, cls)
+        if not guided:
+            return drift_strong, drift_strong_cls
+        assert null is not None
+        weak = model(*inputs, null, cls.to(dtype), uncond=True)
+        drift_weak = drift(weak.velocity, latent)
+        drift_weak_cls = drift(weak.cls_velocity, cls)
+        weight = cfg.guidance
         return (
-            torch.lerp(unconditional.velocity, conditional.velocity, weight),
-            torch.lerp(unconditional.cls_velocity, conditional.cls_velocity, weight),
+            drift_weak + weight * (drift_strong - drift_weak),
+            drift_weak_cls + weight * (drift_strong_cls - drift_weak_cls),
         )

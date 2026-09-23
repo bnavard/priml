@@ -19,12 +19,13 @@ References:
     Bhanded 2025, "Speedrunning ImageNet Diffusion."
   https://arxiv.org/abs/2401.08740
     Ma et al. 2024, "SiT: Exploring Flow and Diffusion-based Generative Models."
+
 """
 
 from __future__ import annotations
 
 from dataclasses import KW_ONLY, field
-from typing import NamedTuple, Self, override
+from typing import NamedTuple, Protocol, Self, cast, override
 
 import math
 
@@ -39,12 +40,14 @@ from priml.cost import (
     elementwise_cost,
     map_cost,
     matmul_cost,
-    reduction_cost,
     set_cost,
     traffic,
 )
+from priml.math.custom_types import TensorFn
+from priml.model.attention.kernel import SdpaFused
 from priml.model.custom_types import (
     ActivationFn,
+    AttentionKernel,
     ChannelsIn,
     TensorModule,
     propagate_attr,
@@ -63,6 +66,7 @@ __all__ = [
     "SpeedrunDiT",
     "SprintRouting",
     "TimestepEmbedder",
+    "ValueBlend",
     "ValueResidual",
     "VisionRoPE",
     "gelu_tanh",
@@ -432,12 +436,14 @@ class LabelEmbedder(nn.Module):
 
             """
             del kwargs
+            # One row read per lookup, as ``priml.model.embedding`` counts it.
+            table = self.num_rows * self.channels_out
             return traffic(
                 "primal",
                 "selection",
                 elements=batch_size * self.channels_out,
                 dtype=dtype,
-            ).replace(params=self.num_rows * self.channels_out)
+            ) + Cost(params=table, params_active=self.channels_out)
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -563,6 +569,22 @@ class AdaLNModulation(nn.Module):
         del kwargs
         return self.modulation(c).chunk(self.num_groups, dim=-1)
 
+    @property
+    def proj(self) -> nn.Linear:
+        """The projection initialization zeroes.
+
+        Returns:
+          proj: The last layer of ``modulation``.
+
+        """
+        return _linear(self.modulation[-1])
+
+
+def _linear(module: nn.Module) -> nn.Linear:
+    """Narrow a container's member to the linear layer it is built as."""
+    assert isinstance(module, nn.Linear)
+    return module
+
 
 class FeedForward(nn.Module):
     """Two-layer position-wise feed-forward network."""
@@ -634,8 +656,7 @@ class FeedForward(nn.Module):
                 )
                 + cost(
                     self.activation,
-                    channels=self.channels_hidden,
-                    rows=rows,
+                    channels=self.channels_hidden * rows,
                     dtype=dtype,
                 )
             )
@@ -643,7 +664,7 @@ class FeedForward(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.fc1 = nn.Linear(config.channels_in, config.channels_hidden, config.bias)
-        self.act = config.activation
+        self.act = _activation(config.activation)
         self.fc2 = nn.Linear(config.channels_hidden, config.channels_in, config.bias)
 
     @override
@@ -660,6 +681,23 @@ class FeedForward(nn.Module):
         """
         del kwargs
         return self.fc2(self.act(self.fc1(x)))
+
+
+def _activation(activation: ActivationFn) -> TensorFn:
+    """Build an activation from a config, or pass a callable through."""
+    if isinstance(activation, Makeable):
+        # ``Makeable`` is runtime-checkable, so isinstance erases its type
+        # parameter: ``make`` reads as returning ``object`` without the cast.
+        return cast(TensorFn, activation.make())
+    return activation
+
+
+class ValueBlend(Protocol):
+    """Blends one layer's attention values with the first layer's."""
+
+    def __call__(self, v: Tensor, first: Tensor, /) -> Tensor:
+        """Apply to the input."""
+        ...
 
 
 class ValueResidual(nn.Module):
@@ -710,7 +748,8 @@ class ValueResidual(nn.Module):
                 rows=seq_len * batch_size * heads,
                 dtype=dtype,
                 inputs=2,
-            ).replace(params=1)
+                params=1,
+            )
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -868,101 +907,6 @@ class VisionRoPE(nn.Module):
         return torch.cat([x[:, :, :lead, :], rotated], dim=-2)
 
 
-class FusedSdpa(nn.Module):
-    """Scaled dot-product attention over a head-major layout.
-
-    Priml's ``SdpaFused`` takes ``[..., tokens, heads, channels_head]`` and
-    transposes internally; this kernel takes the head-major layout the
-    projection already produces, so no view sits between the projection and the
-    kernel. Keeping the layout fixed is what makes the kernel choice -- and
-    therefore the last mantissa bit -- reproducible.
-    """
-
-    class Config(Fig["FusedSdpa"], kw_only=False):
-        """Configuration for FusedSdpa."""
-
-        @classmethod
-        def cost(
-            cls,
-            *,
-            seq_len: int,
-            batch_size: int,
-            heads: int,
-            channels_head: int,
-            dtype: torch.dtype | None,
-            **kwargs: object,
-        ) -> Cost:
-            """Cost one attention kernel invocation.
-
-            Args:
-              seq_len: Tokens per sequence.
-              batch_size: Sequences per step.
-              heads: Attention heads.
-              channels_head: Width of one head.
-              dtype: Activation dtype; ``None`` is torch's default.
-              **kwargs: The open bus, unread here.
-
-            Returns:
-              cost: Whole-invocation cost of this kernel.
-
-            """
-            del kwargs
-            rows = batch_size * heads * seq_len
-            scores = matmul_cost(
-                channels_in=channels_head,
-                channels_out=seq_len,
-                rows=rows,
-                dtype=dtype,
-            )
-            values = matmul_cost(
-                channels_in=seq_len,
-                channels_out=channels_head,
-                rows=rows,
-                dtype=dtype,
-            )
-            softmax = reduction_cost(
-                input_elements=rows * seq_len,
-                output_groups=rows,
-                dtype=dtype,
-            ) + reduction_cost(
-                input_elements=rows * seq_len,
-                output_groups=rows,
-                dtype=dtype,
-                phase="adjoint",
-            )
-            return scores + values + softmax
-
-    def __init__(self, config: Config) -> None:
-        super().__init__()
-        del config
-
-    @override
-    def forward(
-        self,
-        q: Tensor,
-        k: Tensor,
-        v: Tensor,
-        *,
-        dropout_p: float = 0.0,
-        **kwargs: object,
-    ) -> Tensor:
-        """Attend bidirectionally.
-
-        Args:
-          q: Queries, ``[batch, heads, tokens, channels_head]``.
-          k: Keys, same shape.
-          v: Values, same shape.
-          dropout_p: Attention dropout probability.
-          **kwargs: The open bus, unread here.
-
-        Returns:
-          attended: Same shape as ``q``.
-
-        """
-        del kwargs
-        return nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-
-
 class SelfAttention(nn.Module):
     """Bidirectional multi-head self-attention with rotary positions."""
 
@@ -986,16 +930,20 @@ class SelfAttention(nn.Module):
         dropout: float = 0.0
         """Attention dropout probability, applied only while training."""
 
-        norm_qk: Makeable[TensorModule] | None = None
+        norm_qk: Makeable[TensorModule] | None = field(
+            default_factory=lambda: RMSNorm.Config(eps=None, elementwise_affine=True),
+        )
         """Per-head query and key normalization; ``None`` leaves them raw.
 
         Two independent modules are built, matching the reference, so a norm
-        carrying parameters learns a separate scale for queries and keys."""
+        carrying parameters learns a separate scale for queries and keys.
+        ``eps=None`` is not "no epsilon": torch substitutes the dtype's own,
+        which is what the reference's bare ``nn.RMSNorm(head_dim)`` uses."""
 
-        attn_kernel: Makeable[TensorModule] = field(default_factory=FusedSdpa.Config)
-        """The attention kernel itself, over a head-major layout."""
+        attn_kernel: Makeable[AttentionKernel] = field(default_factory=SdpaFused.Config)
+        """The attention kernel, over priml's ``[..., tokens, heads, channels]``."""
 
-        value_residual: Makeable[TensorModule] | None = None
+        value_residual: Makeable[ValueBlend] | None = None
         """Blend toward the first layer's values; ``None`` disables it."""
 
         @override
@@ -1040,6 +988,8 @@ class SelfAttention(nn.Module):
                 "seq_len": seq_len,
                 "batch_size": batch_size,
                 "heads": self.heads,
+                # The shared kernel's cost reads priml's kernel spelling.
+                "num_heads": self.heads,
                 "channels_head": self.channels_head,
                 "dtype": dtype,
                 **kwargs,
@@ -1072,13 +1022,17 @@ class SelfAttention(nn.Module):
         self.channels_head = config.channels_head
         self.dropout = config.dropout
         inner = config.heads * config.channels_head
+        # Registered FIRST: the reference's blend weight is the attention
+        # module's own parameter, which ``named_parameters`` yields before any
+        # child's, and the gradient clip reduces its norm in that order. It
+        # draws no randomness, so moving it shifts no initialization.
+        self.value_residual = (
+            None if config.value_residual is None else config.value_residual.make()
+        )
         self.qkv = nn.Linear(config.channels_in, inner * 3, bias=config.bias)
         self.q_norm = nn.Identity() if config.norm_qk is None else config.norm_qk.make()
         self.k_norm = nn.Identity() if config.norm_qk is None else config.norm_qk.make()
         self.proj = nn.Linear(inner, config.channels_in, bias=True)
-        self.value_residual = (
-            None if config.value_residual is None else config.value_residual.make()
-        )
         self.attn_kernel = config.attn_kernel.make()
 
     @override
@@ -1086,7 +1040,7 @@ class SelfAttention(nn.Module):
         self,
         x: Tensor,
         *,
-        rope: TensorModule | None = None,
+        rope: VisionRoPE | None = None,
         positions: Tensor | None = None,
         first_values: Tensor | None = None,
         **kwargs: object,
@@ -1128,13 +1082,15 @@ class SelfAttention(nn.Module):
         if rope is not None and positions is not None:
             q = rope(q, positions)
             k = rope(k, positions)
+        # Stride views both ways: the kernel's own transpose undoes these, so
+        # SDPA receives exactly the head-major tensors built above.
         attended = self.attn_kernel(
-            q,
-            k,
-            v,
+            q.transpose(1, 2),
+            k.transpose(1, 2),
+            v.transpose(1, 2),
             dropout_p=self.dropout if self.training else 0.0,
         )
-        attended = attended.transpose(1, 2).reshape(batch, tokens, channels)
+        attended = attended.reshape(batch, tokens, channels)
         return self.proj(attended), raw_values
 
 
@@ -1247,7 +1203,7 @@ class DiTBlock(nn.Module):
         x: Tensor,
         c: Tensor,
         *,
-        rope: TensorModule | None = None,
+        rope: VisionRoPE | None = None,
         positions: Tensor | None = None,
         first_values: Tensor | None = None,
         **kwargs: object,
@@ -1491,13 +1447,14 @@ class SprintRouting(nn.Module):
 
             """
             del kwargs
+            # Plus the mask token, which this module owns and every refill reads.
             return matmul_cost(
                 channels_in=2 * self.channels_in,
                 channels_out=self.channels_in,
                 bias=True,
                 rows=seq_len * batch_size,
                 dtype=dtype,
-            ).replace(params_active=self.channels_in)
+            ) + Cost(params=self.channels_in, params_active=self.channels_in)
 
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -1637,9 +1594,6 @@ class SpeedrunDiT(nn.Module):
         num_classes: int = 1000
         """Real classes; the null class for guidance is appended beyond them."""
 
-        class_dropout: float = 0.1
-        """Probability of dropping a label to the null class while training."""
-
         projector_dims: tuple[int, ...] = (768,)
         """Width of each alignment target; one projector is built per entry."""
 
@@ -1679,14 +1633,6 @@ class SpeedrunDiT(nn.Module):
         )
         """Value-residual template; the first block never receives one, having
         no earlier layer to blend toward."""
-
-        norm_qk: Makeable[TensorModule] | None = field(
-            default_factory=lambda: RMSNorm.Config(eps=None, elementwise_affine=True),
-        )
-        """Per-head query and key normalization; ``None`` leaves them raw.
-
-        ``eps=None`` is not "no epsilon": torch substitutes the dtype's own,
-        which is what the reference's bare ``nn.RMSNorm(head_dim)`` uses."""
 
         sprint: SprintRouting.Config | None = field(
             default_factory=SprintRouting.Config,
@@ -1761,7 +1707,6 @@ class SpeedrunDiT(nn.Module):
             self.time_embedder.channels_out = self.channels_hidden
             self.label_embedder.channels_in = self.num_classes
             self.label_embedder.channels_out = self.channels_hidden
-            self.label_embedder.dropout = self.class_dropout
 
             if self.rope is not None:
                 self.rope.channels_head = self.channels_hidden // self.heads
@@ -1770,7 +1715,6 @@ class SpeedrunDiT(nn.Module):
             self.block.channels_in = self.channels_hidden
             self.block.cond_dim = self.channels_hidden
             self.block.attn.heads = self.heads
-            self.block.attn.norm_qk = self.norm_qk
 
             # The trunk hands the readout its own width: the reference exposes
             # a separate decoder width, but no projection sits between them and
@@ -1972,21 +1916,24 @@ class SpeedrunDiT(nn.Module):
         # The patch projection is a convolution but initialized like the linear
         # layer it is equivalent to at stride == kernel, so its fan-in counts
         # the whole patch rather than one spatial position.
-        weight = self.x_embedder.proj.weight.data
+        patches = self.x_embedder.proj
+        weight = patches.weight.data
         nn.init.xavier_uniform_(weight.view([weight.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
+        if patches.bias is not None:
+            nn.init.constant_(patches.bias, 0)
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        nn.init.normal_(_linear(self.t_embedder.mlp[0]).weight, std=0.02)
+        nn.init.normal_(_linear(self.t_embedder.mlp[2]).weight, std=0.02)
+        zeroed: list[nn.Linear] = []
         for block in self.blocks:
-            nn.init.constant_(block.modulation.modulation[-1].weight, 0)
-            nn.init.constant_(block.modulation.modulation[-1].bias, 0)
+            assert isinstance(block, DiTBlock)
+            zeroed.append(block.modulation.proj)
         final = self.final_layer
-        nn.init.constant_(final.modulation.modulation[-1].weight, 0)
-        nn.init.constant_(final.modulation.modulation[-1].bias, 0)
-        for readout in (final.linear, final.linear_cls):
-            nn.init.constant_(readout.weight, 0)
-            nn.init.constant_(readout.bias, 0)
+        zeroed += [final.modulation.proj, final.linear, final.linear_cls]
+        for layer in zeroed:
+            nn.init.constant_(layer.weight, 0)
+            if layer.bias is not None:
+                nn.init.constant_(layer.bias, 0)
 
     def unpatchify(self, x: Tensor) -> Tensor:
         """Fold patch values back into a latent grid.

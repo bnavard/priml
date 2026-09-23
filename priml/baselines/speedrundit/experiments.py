@@ -1,7 +1,8 @@
 r"""SR-DiT experiment ladder.
 
-``exp000`` REPRODUCES the pinned reference rather than stating a naive recipe
-of our own, and is never edited. That is a departure from the usual meaning of
+``exp000`` REPRODUCES the reference pinned at
+c24c2ff25699cce63174ca56c2afcfeeb225e367 rather than stating a naive recipe of
+our own, and is never edited. That is a departure from the usual meaning of
 ``exp000`` and it is deliberate: the baseline exists to establish that Priml's
 components compute the published model exactly, so the control has to be the
 published model, SPRINT routing and value residuals included. The bit-for-bit
@@ -105,7 +106,7 @@ def exp000() -> SpeedrunDiTLoop:
     model.num_layers = 12
     model.heads = 12
     model.num_classes = NUM_CLASSES
-    model.class_dropout = 0.1
+    model.label_embedder.dropout = 0.1
     model.projector_dims = (ENCODER_WIDTH,)
     model.projector_hidden = 2048
 
@@ -133,8 +134,12 @@ def exp_smoke() -> SpeedrunDiTLoop:
 
     Not a result: nothing measured here is comparable with exp000.
 
+    The corpus it reads is a synthetic one at this geometry::
+
+      uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --synthetic --samples 4 --image-size 8 --latent-size 4 --latent-channels 8 --num-classes 10 --encoder-width 16  # noqa: E501
+
     Returns:
-      cfg: A tiny loop that runs on CPU without a prepared corpus.
+      cfg: A tiny loop that runs on CPU over that synthetic corpus.
 
     """
     cfg = exp000()

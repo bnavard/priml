@@ -11,6 +11,12 @@ reference's own preprocessing::
         00000/img-latents-00000000.npy   # float32 [1, C, H, W] INVAE latent
         ...
         dataset.json                     # {"labels": [[name, class], ...]}
+      cls_token.npy                      # float32 [N, width], required
+      features.npy                       # float32 [N, 1 + H * W, width], optional
+
+The last two are the frozen encoder's class and patch features, in latent
+order. They are not part of the reference's layout -- it encodes them from
+the images every step -- so a real corpus needs them precomputed.
 
 Two facts about that layout are load-bearing and easy to lose. The two trees
 are enumerated and sorted INDEPENDENTLY and then paired by position, which
@@ -30,14 +36,13 @@ from dataclasses import KW_ONLY
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NotRequired, Self, TypedDict, cast, override
 
-import numpy as np
-
 from configgle import Fig
 from torch import Tensor
 
+import numpy as np
 import torch
 
-from priml.lib.custom_json import DictCodec, ListCodec, loads
+from priml.lib.custom_json import DictCodec, IntCodec, ListCodec, StrCodec, loads
 from priml.math.seed import salt
 from priml.paths import resolve_working_dir
 from priml.runtime import get_device
@@ -45,12 +50,12 @@ from priml.timer import CheckpointableStepTimer
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Callable, Iterator, Mapping
 
     from numpy.typing import NDArray
 
 
-__all__ = ["SpeedrunDiTBatch", "SpeedrunDiTData"]
+__all__ = ["SpeedrunDiTBatch", "SpeedrunDiTData", "read_labels", "relative_names"]
 
 
 LATENT_RANK: Final = 4
@@ -167,9 +172,10 @@ class SpeedrunDiTData:
             return super().finalize()
 
     class StateDict(TypedDict):
-        """Checkpoint payload."""
+        """Checkpoint payload; ``active_pass`` is None between passes."""
 
         passes: int
+        active_pass: int | None
         next_batch: int
         timer_epoch: Mapping[str, object]
 
@@ -181,8 +187,8 @@ class SpeedrunDiTData:
         self.timer_epoch = CheckpointableStepTimer()
         self._corpus: _Corpus | None = None
         self._passes = 0
+        self._active_pass: int | None = None
         self._next_batch = 0
-        self._pending: SpeedrunDiTData.StateDict | None = None
 
     @property
     def corpus(self) -> _Corpus:
@@ -203,26 +209,19 @@ class SpeedrunDiTData:
             )
         return self._corpus
 
-    def train_dataloader(self) -> Iterator[SpeedrunDiTBatch]:
-        """Iterate one shuffled pass over the corpus.
+    def train_dataloader(self) -> _TrainPasses:
+        """Serve shuffled passes over the corpus, a fresh one per ``iter``.
+
+        Re-iterable rather than an iterator: the loop asks for this once and
+        calls ``iter`` on it at every epoch boundary, so an exhausted generator
+        here would end the run at the first boundary.
 
         Returns:
-          batches: Shuffled batches; a short final batch is dropped unless
-          ``drop_last`` is off.
+          passes: An iterable whose every iteration walks one pass; a short
+          final batch is dropped unless ``drop_last`` is off.
 
         """
-        corpus = self.corpus
-        start = self._next_batch
-        self._next_batch = 0
-        order = self._permutation(corpus.count, self._passes)
-        self._passes += 1
-        return self._iterate(
-            corpus,
-            order,
-            self.config.batch_size,
-            drop_last=self.config.drop_last,
-            skip=start,
-        )
+        return _TrainPasses(self._train_pass, self.__len__)
 
     def eval_dataloader(self) -> Iterator[SpeedrunDiTBatch]:
         """Iterate the corpus once, in stored order.
@@ -233,24 +232,21 @@ class SpeedrunDiTData:
         """
         corpus = self.corpus
         order = torch.arange(corpus.count, device=corpus.media.device)
-        return self._iterate(
-            corpus,
-            order,
-            self.eval_batch_size,
-            drop_last=False,
-            skip=0,
-        )
+        size = self.eval_batch_size
+        for rows in order.split(size):
+            yield corpus.batch(rows, width=size, valid=int(rows.numel()))
 
     def state_dict(self) -> StateDict:
         """Capture the loader position.
 
         Returns:
-          state: Passes completed, the next batch within the pass, and the
-          epoch timer.
+          state: Passes started, the pass in progress, the next batch within
+          it, and the epoch timer.
 
         """
         return {
             "passes": self._passes,
+            "active_pass": self._active_pass,
             "next_batch": self._next_batch,
             "timer_epoch": self.timer_epoch.state_dict(),
         }
@@ -258,10 +254,9 @@ class SpeedrunDiTData:
     def load_state_dict(self, state_dict: Mapping[str, object]) -> None:
         """Restore the loader position.
 
-        The position is applied to the NEXT ``train_dataloader`` call rather
-        than now, because the loop restores before it asks for an iterator and
-        a pass replayed from the start would re-walk data the checkpoint had
-        already consumed.
+        Takes effect when the next pass begins iterating, because the loop
+        restores before it asks for an iterator; an interrupted pass resumes
+        on its own permutation at the batch the checkpoint had not yet seen.
 
         Args:
           state_dict: A payload from :meth:`state_dict`.
@@ -269,6 +264,7 @@ class SpeedrunDiTData:
         """
         state = cast(SpeedrunDiTData.StateDict, state_dict)
         self._passes = state["passes"]
+        self._active_pass = state["active_pass"]
         self._next_batch = state["next_batch"]
         self.timer_epoch.load_state_dict(state["timer_epoch"])
 
@@ -282,7 +278,7 @@ class SpeedrunDiTData:
         count, size = self.corpus.count, self.config.batch_size
         if self.config.drop_last:
             return count // size
-        return -(-count // size)
+        return (count + size - 1) // size
 
     def _permutation(self, count: int, pass_index: int) -> Tensor:
         """Draw the visiting order for one pass.
@@ -299,46 +295,53 @@ class SpeedrunDiTData:
           order: A permutation of ``[0, count)``.
 
         """
-        # A named stream, not the global one: the order has to be rebuildable
-        # from (seed, pass) alone, because resume replays the pass it was
-        # interrupted in rather than restoring a saved permutation.
         generator = torch.Generator()
         generator.manual_seed(salt("speedrundit_shuffle", self.config.seed, pass_index))
         order = torch.randperm(count, generator=generator)
         return order.to(self.corpus.media.device)
 
-    def _iterate(
-        self,
-        corpus: _Corpus,
-        order: Tensor,
-        size: int,
-        *,
-        drop_last: bool,
-        skip: int,
-    ) -> Iterator[SpeedrunDiTBatch]:
-        """Slice an order into batches.
-
-        Args:
-          corpus: The resident tensors.
-          order: Visiting order.
-          size: Samples per batch.
-          drop_last: Discard a short final batch.
-          skip: Batches to skip, for a mid-pass resume.
+    def _train_pass(self) -> Iterator[SpeedrunDiTBatch]:
+        """Walk the pass in progress, or begin the next one.
 
         Yields:
-          batch: One batch.
+          batch: One training batch.
 
         """
+        corpus = self.corpus
+        if self._active_pass is None:
+            self._active_pass = self._passes
+            self._passes += 1
+            self._next_batch = 0
+        order = self._permutation(corpus.count, self._active_pass)
+        size = self.config.batch_size
         for index, rows in enumerate(order.split(size)):
             valid = int(rows.numel())
-            if drop_last and valid != size:
+            if (self.config.drop_last and valid != size) or index < self._next_batch:
                 continue
-            if index < skip:
-                continue
-            # Recorded BEFORE the yield: a checkpoint taken mid-pass saves the
-            # index of the batch the consumer has not seen yet.
+            # Recorded BEFORE the yield: a checkpoint taken after the consumer
+            # steps on this batch saves the index of the one it has not seen.
             self._next_batch = index + 1
             yield corpus.batch(rows, width=size, valid=valid)
+        self._active_pass = None
+        self._next_batch = 0
+
+
+class _TrainPasses:
+    """The training stream: each ``iter`` walks one pass over the corpus."""
+
+    def __init__(
+        self,
+        walk: Callable[[], Iterator[SpeedrunDiTBatch]],
+        length: Callable[[], int],
+    ) -> None:
+        self._walk = walk
+        self._length = length
+
+    def __iter__(self) -> Iterator[SpeedrunDiTBatch]:
+        return self._walk()
+
+    def __len__(self) -> int:
+        return self._length()
 
 
 class _Corpus:
@@ -395,6 +398,32 @@ def _pad(x: Tensor, pad: int) -> Tensor:
         return x
     filler = x.new_zeros((pad, *x.shape[1:]))
     return torch.cat([x, filler], dim=0)
+
+
+def read_labels(manifest: Path) -> dict[str, int]:
+    """Read the label manifest, keyed by slash-separated latent name.
+
+    One parser for the loader and the preparer's verifier: two would agree
+    only until one of them stopped normalizing separators.
+
+    Args:
+      manifest: ``vae-in/dataset.json``.
+
+    Returns:
+      labels: Class index per relative latent name.
+
+    """
+    payload = DictCodec.coerce(loads(manifest.read_text(encoding="utf-8")))
+    entries = [ListCodec.coerce(entry) for entry in ListCodec.coerce(payload["labels"])]
+    # Keys are normalized to forward slashes: a corpus prepared on Windows
+    # writes backslashes into the manifest but is read on either platform.
+    return {
+        StrCodec.coerce(entry[0]).replace("\\", "/"): IntCodec.coerce(
+            entry[1],
+            default=None,
+        )
+        for entry in entries
+    }
 
 
 def relative_names(root: Path) -> list[str]:
@@ -466,11 +495,7 @@ def _load_corpus(
         latent_names = latent_names[:limit]
         image_names = image_names[:limit]
 
-    payload = DictCodec.coerce(loads(manifest.read_text(encoding="utf-8")))
-    entries = ListCodec.coerce(payload["labels"], list)
-    # Keys are normalized to forward slashes: a corpus prepared on Windows
-    # writes backslashes into the manifest but is read on either platform.
-    table = {str(entry[0]).replace("\\", "/"): int(entry[1]) for entry in entries}
+    table = read_labels(manifest)
     labels = [table[name] for name in latent_names]
 
     latents = [np.load(latents_dir / name) for name in latent_names]
@@ -495,13 +520,25 @@ def _load_corpus(
         ).to(device=device)
 
     count = media.shape[0]
+    # The class token is an INPUT the model diffuses alongside the latent, so
+    # a corpus without one cannot train at all; the per-token alignment
+    # targets are optional, and without them the alignment term is zero.
+    cls_path = directory / "cls_token.npy"
+    if not cls_path.is_file():
+        raise FileNotFoundError(
+            f"No class-token targets at {cls_path}. They are the frozen "
+            "encoder's class features, one row per latent; the synthetic "
+            "corpus writes them, and a real corpus needs them precomputed.",
+        )
     return _Corpus(
         media=media,
         label=torch.tensor(labels, device=device, dtype=torch.long),
-        # Features are a preparation product; a corpus without them trains the
-        # velocity terms alone, with the alignment term identically zero.
-        cls_token=_optional(directory / "cls_token.npy", count, device, dtype),
-        features=_optional_list(directory / "features.npy", count, device, dtype),
+        cls_token=_load_rows(cls_path, count, device, dtype),
+        features=(
+            [_load_rows(directory / "features.npy", count, device, dtype)]
+            if (directory / "features.npy").is_file()
+            else []
+        ),
         images=images,
     )
 
@@ -509,34 +546,22 @@ def _load_corpus(
 def _read_image(path: Path) -> NDArray[np.uint8]:
     """Decode one stored image to ``[channels, height, width]`` uint8."""
     if path.suffix.lower() == ".npy":
-        array = np.load(path)
-        return array.reshape(-1, *array.shape[-2:])
-    from PIL import Image  # noqa: PLC0415 -- Keeps Pillow off the import path of a run using precomputed features.
+        array = cast("NDArray[np.uint8]", np.load(path))
+        shape = cast("tuple[int, ...]", array.shape)
+        return array.reshape(-1, *shape[-2:])
+    # Deferred: a run using precomputed features never loads Pillow.
+    from PIL import Image  # noqa: PLC0415
 
     with Image.open(path) as handle:
         array = np.asarray(handle.convert("RGB"))
     return array.transpose(2, 0, 1)
 
 
-def _optional(
+def _load_rows(
     path: Path,
     count: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tensor:
-    """Read an optional per-sample array, or a zero column when absent."""
-    if not path.is_file():
-        return torch.zeros((count, 1), device=device, dtype=dtype)
+    """Read the first ``count`` rows of a per-sample array."""
     return torch.from_numpy(np.load(path)[:count]).to(device=device, dtype=dtype)
-
-
-def _optional_list(
-    path: Path,
-    count: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> list[Tensor]:
-    """Read optional alignment features; empty when the corpus has none."""
-    if not path.is_file():
-        return []
-    return [torch.from_numpy(np.load(path)[:count]).to(device=device, dtype=dtype)]

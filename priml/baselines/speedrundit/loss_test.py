@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Final, TypedDict, cast
 
 import math
 
-import pytest
-import torch
-
 from configgle import PartialConfig
 from torch import Tensor
+
+import pytest
+import torch
 
 from priml.baselines.speedrundit.loss import (
     SpeedrunDiTLoss,
@@ -51,11 +51,19 @@ def tiny_model() -> SpeedrunDiT:
     return cfg.make()
 
 
-def inputs() -> dict[str, Tensor]:
+class Inputs(TypedDict):
+    """The objective's batch arguments, keyed as it takes them."""
+
+    media: Tensor
+    label: Tensor
+    cls_token: Tensor
+
+
+def inputs() -> Inputs:
     """Build one batch of objective inputs.
 
     Returns:
-      batch: Latents, labels, class features, and alignment targets.
+      batch: Latents, labels, and class features.
 
     """
     generator = torch.Generator().manual_seed(0)
@@ -108,7 +116,8 @@ def test_the_shared_schedule_agrees_with_the_straight_form() -> None:
 
 def test_both_paths_share_the_velocity_target() -> None:
     """The target is ``eps - x`` either way, which is what lets the sampler
-    hand this model's output to ``target_rectified_flow`` unchanged."""
+    hand this model's output to ``target_rectified_flow`` unchanged.
+    """
     t = torch.linspace(0.01, 0.99, 8)
     assert rectified_flow_path(t).d_alpha == linear_path(t).d_alpha
     assert rectified_flow_path(t).d_sigma == linear_path(t).d_sigma
@@ -130,7 +139,8 @@ def test_time_shift_is_the_identity_at_the_base_resolution() -> None:
 
 def test_time_shift_pushes_larger_samples_toward_noise() -> None:
     """A bigger latent carries more redundancy, so the same nominal time
-    destroys less; the shift compensates."""
+    destroys less; the shift compensates.
+    """
     t = torch.full((5,), 0.5)
     shifted = resolution_time_shift(t, shape=(32, 16, 16), base=4096)
     assert torch.all(shifted > t)
@@ -140,7 +150,7 @@ def test_time_shift_pushes_larger_samples_toward_noise() -> None:
 def test_time_shift_matches_the_reference_formula() -> None:
     """Pinned against the closed form rather than a recorded number."""
     t = torch.tensor([0.25])
-    shift = math.sqrt(8192 / 4096)
+    shift = math.sqrt(8192 / 4096)  # noqa: TID251 -- The closed form the reference spells.
     expected = (shift * t) / (1 + (shift - 1) * t)
     assert torch.equal(resolution_time_shift(t, shape=(32, 16, 16)), expected)
 
@@ -150,7 +160,8 @@ def test_samplers_produce_times_in_range() -> None:
     for sampler in (uniform_time, logit_normal_time):
         t = sampler(256)
         assert t.shape == (256, 1, 1, 1)
-        assert torch.all(t >= 0) and torch.all(t <= 1), sampler.__name__
+        assert torch.all(t >= 0), sampler.__name__
+        assert torch.all(t <= 1), sampler.__name__
 
 
 def test_mean_flat_reduces_everything_but_the_batch() -> None:
@@ -227,7 +238,8 @@ def test_projection_rewards_alignment() -> None:
 
 def test_contrastive_term_is_negative() -> None:
     """CFM subtracts a distance, so minimizing the total pushes the field away
-    from the batch neighbour's target."""
+    from the batch neighbour's target.
+    """
     model = tiny_model()
     result = SpeedrunDiTLoss.Config().make()(model, **inputs())
     assert result.cfm.item() <= 0.0
@@ -278,7 +290,8 @@ def test_the_path_is_injected_not_branched() -> None:
 
 def test_the_time_transform_slot_can_be_rebound() -> None:
     """``base`` rides in the tree through ``PartialConfig`` rather than as a
-    keyword nobody can print."""
+    keyword nobody can print.
+    """
     cfg = SpeedrunDiTLoss.Config(
         time_transform=PartialConfig(resolution_time_shift, base=64),
     )
@@ -296,7 +309,8 @@ def test_per_sample_terms_keep_the_batch_axis(term: str) -> None:
     """Per-sample errors stay per-sample so a metric can weight them."""
     model = tiny_model()
     result = SpeedrunDiTLoss.Config().make()(model, **inputs())
-    assert getattr(result, term).shape == (BATCH,)
+    value = cast(Tensor, getattr(result, term))
+    assert value.shape == (BATCH,)
 
 
 if __name__ == "__main__":

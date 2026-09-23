@@ -12,8 +12,9 @@ import json
 
 import pytest
 
-from priml.baselines.speedrundit.data import SpeedrunDiTData
+from priml.baselines.speedrundit.data import SpeedrunDiTData, read_labels
 from priml.baselines.speedrundit.scripts import prepare_data
+from priml.lib.custom_json import DictCodec, ListCodec, StrCodec, loads
 
 
 def test_default_directory_matches_the_loader(tmp_path: Path) -> None:
@@ -44,7 +45,7 @@ def test_synthetic_writes_the_layout_the_loader_reads(tmp_path: Path) -> None:
     )
     manifest = target / "vae-in" / "dataset.json"
     assert manifest.is_file()
-    assert len(json.loads(manifest.read_text(encoding="utf-8"))["labels"]) == 4
+    assert len(read_labels(manifest)) == 4
     assert (target / "cls_token.npy").is_file()
     assert (target / "features.npy").is_file()
 
@@ -131,6 +132,31 @@ def test_verify_counts_a_good_corpus(tmp_path: Path) -> None:
     assert prepare_data.verify(target) == 5
 
 
+def test_verify_accepts_what_the_loader_reads(tmp_path: Path) -> None:
+    """A manifest written on Windows carries backslashes, which the loader
+    normalizes; a verifier that did not would refuse a readable corpus.
+    """
+    target = tmp_path / "corpus"
+    prepare_data.synthesize(
+        target,
+        samples=2,
+        image_size=8,
+        latent_size=4,
+        latent_channels=8,
+        num_classes=10,
+        encoder_width=16,
+        seed=0,
+    )
+    manifest = target / "vae-in" / "dataset.json"
+    payload = DictCodec.coerce(loads(manifest.read_text(encoding="utf-8")))
+    payload["labels"] = [
+        [StrCodec.coerce(entry[0]).replace("/", "\\"), entry[1]]
+        for entry in map(ListCodec.coerce, ListCodec.coerce(payload["labels"]))
+    ]
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    assert prepare_data.verify(target) == 2
+
+
 def test_verify_names_a_missing_manifest(tmp_path: Path) -> None:
     """Labels live in ``vae-in/dataset.json`` and nowhere else."""
     target = tmp_path / "corpus"
@@ -153,8 +179,8 @@ def test_verify_catches_an_unlabelled_latent(tmp_path: Path) -> None:
         seed=0,
     )
     manifest = target / "vae-in" / "dataset.json"
-    payload = json.loads(manifest.read_text(encoding="utf-8"))
-    payload["labels"] = payload["labels"][:2]
+    payload = DictCodec.coerce(loads(manifest.read_text(encoding="utf-8")))
+    payload["labels"] = ListCodec.coerce(payload["labels"])[:2]
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="no label"):
         _ = prepare_data.verify(target)

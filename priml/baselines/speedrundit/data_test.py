@@ -7,8 +7,7 @@ files rather than asserted from the source.
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import json
 
@@ -17,6 +16,10 @@ import pytest
 import torch
 
 from priml.baselines.speedrundit.data import SpeedrunDiTData, relative_names
+
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 CHANNELS: Final = 8
@@ -29,8 +32,9 @@ def write_corpus(
     *,
     count: int = 8,
     features: bool = True,
+    cls_token: bool = True,
 ) -> None:
-    """Write a corpus in the reference's layout.
+    """Write a corpus in the reference's layout, plus this loader's targets.
 
     Each latent is a distinct constant, so a row is identifiable by value and
     an ordering bug shows up as a wrong number rather than a wrong shape.
@@ -38,7 +42,8 @@ def write_corpus(
     Args:
       root: Destination directory.
       count: Samples to write.
-      features: Whether to write alignment targets beside the corpus.
+      features: Whether to write the per-token alignment targets.
+      cls_token: Whether to write the class-token targets.
 
     """
     images = root / "images" / "00000"
@@ -61,9 +66,10 @@ def write_corpus(
         json.dumps({"labels": labels}),
         encoding="utf-8",
     )
+    if cls_token:
+        np.save(root / "cls_token.npy", np.zeros((count, WIDTH), np.float32))
     if features:
         tokens = 1 + SIZE * SIZE
-        np.save(root / "cls_token.npy", np.zeros((count, WIDTH), np.float32))
         np.save(root / "features.npy", np.zeros((count, tokens, WIDTH), np.float32))
 
 
@@ -106,7 +112,8 @@ def test_batch_carries_the_named_contract(tmp_path: Path) -> None:
 
 def test_the_singleton_encode_axis_is_dropped(tmp_path: Path) -> None:
     """The encoder wrote one sample per file, so each carries a batch axis of
-    one that the corpus must not keep."""
+    one that the corpus must not keep.
+    """
     write_corpus(tmp_path)
     assert make(tmp_path).corpus.media.ndim == 4
 
@@ -165,6 +172,54 @@ def test_consecutive_passes_differ(tmp_path: Path) -> None:
     assert not torch.equal(first, second)
 
 
+def test_one_loader_serves_every_pass(tmp_path: Path) -> None:
+    """The loop asks for the loader once and calls ``iter`` at each boundary.
+
+    A one-shot generator passes every single-pass test and then ends the run
+    at the first epoch boundary, because re-iterating it yields nothing.
+    """
+    write_corpus(tmp_path)
+    loader = make(tmp_path).train_dataloader()
+    passes = [torch.cat([b["media"] for b in loader]) for _ in range(3)]
+    assert all(len(p) == 8 for p in passes)
+    assert not torch.equal(passes[0], passes[1])
+    assert len(loader) == 4
+
+
+def test_eval_leaves_the_train_position_alone(tmp_path: Path) -> None:
+    """The loop evaluates mid-pass and may checkpoint right after.
+
+    An eval that moved the train cursor would make that checkpoint resume
+    past batches the run never trained on.
+    """
+    write_corpus(tmp_path)
+    data = make(tmp_path, eval_batch_size=1)
+    stream = iter(data.train_dataloader())
+    _ = next(stream)
+    before = data.state_dict()
+    _ = list(data.eval_dataloader())
+    assert data.state_dict() == before
+
+
+def test_resume_between_passes_starts_the_next_pass(tmp_path: Path) -> None:
+    """A checkpoint taken at a boundary resumes on the NEXT permutation."""
+    write_corpus(tmp_path)
+    reference = make(tmp_path)
+    loader = reference.train_dataloader()
+    _ = list(loader)
+    expected = [b["media"].clone() for b in loader]
+
+    finished = make(tmp_path)
+    _ = list(finished.train_dataloader())
+    resumed = make(tmp_path)
+    resumed.load_state_dict(finished.state_dict())
+    actual = [b["media"].clone() for b in resumed.train_dataloader()]
+
+    assert len(actual) == 4
+    for left, right in zip(expected, actual, strict=True):
+        assert torch.equal(left, right)
+
+
 def test_a_short_final_batch_is_dropped_by_default(tmp_path: Path) -> None:
     """Training keeps a constant shape so a compiled step never retraces."""
     write_corpus(tmp_path, count=7)
@@ -195,7 +250,7 @@ def test_resume_continues_the_interrupted_pass(tmp_path: Path) -> None:
     expected = [b["media"].clone() for b in reference.train_dataloader()]
 
     interrupted = make(tmp_path)
-    stream = interrupted.train_dataloader()
+    stream = iter(interrupted.train_dataloader())
     taken = [next(stream)["media"].clone()]
     state = interrupted.state_dict()
 
@@ -243,19 +298,33 @@ def test_num_samples_takes_a_prefix(tmp_path: Path) -> None:
 
 
 def test_a_corpus_without_features_still_loads(tmp_path: Path) -> None:
-    """Alignment targets are a preparation product, not a requirement."""
+    """Alignment targets are optional; without them that term is zero."""
     write_corpus(tmp_path, features=False)
     batch = next(iter(make(tmp_path).eval_dataloader()))
     assert batch["features"] == []
+    assert batch["cls_token"].shape == (2, WIDTH)
+
+
+def test_a_corpus_without_class_tokens_is_refused(tmp_path: Path) -> None:
+    """The class token is a model INPUT, so its absence cannot be papered over.
+
+    A placeholder column would load, then fail inside the class projection
+    with a shape error naming neither the file nor the fix.
+    """
+    write_corpus(tmp_path, cls_token=False)
+    with pytest.raises(FileNotFoundError, match=r"cls_token\.npy"):
+        _ = next(iter(make(tmp_path).eval_dataloader()))
 
 
 def test_images_are_absent_unless_asked_for(tmp_path: Path) -> None:
     """Images are ~50x the latents and a run using precomputed features never
-    reads them."""
+    reads them.
+    """
     write_corpus(tmp_path)
     assert "raw_image" not in next(iter(make(tmp_path).eval_dataloader()))
-    kept = make(tmp_path, keep_images=True)
-    assert next(iter(kept.eval_dataloader()))["raw_image"].shape == (2, 3, SIZE, SIZE)
+    kept = next(iter(make(tmp_path, keep_images=True).eval_dataloader()))
+    assert "raw_image" in kept
+    assert kept["raw_image"].shape == (2, 3, SIZE, SIZE)
 
 
 def test_a_missing_corpus_names_the_preparer(tmp_path: Path) -> None:

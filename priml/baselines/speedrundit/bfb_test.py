@@ -1,79 +1,75 @@
 """Bit-for-bit goldens for SR-DiT.
 
 These freeze what ``scripts/parity.py`` established against the pinned
-reference. The parity script needs a network and a clone and runs once; these
-run on CPU in the ordinary suite and are what catch a regression afterwards.
+reference, at the parity script's own geometry. The script needs a network and
+a clone and runs once; these run on CPU in the ordinary suite and are what
+catch a regression afterwards.
 
-Three goldens, because they fail for different reasons. ``init`` freezes the
-construction order -- reorder two submodules and the RNG stream shifts, and
-every weight moves. ``forward`` freezes the op order through routing, rotary
-positions, and the value residual. ``five_steps`` drives the real train step,
-so the objective, the drawn times and noise, the clip, the EMA and AdamW's
-moments all reach the compared post-state -- a golden over a hand-rolled loop
-beside it would stop noticing when the recipe moved.
+Three goldens, because they fail for different reasons. ``source_init`` is the
+REFERENCE's initialization, minted by the parity script and never by this
+file: reorder two submodules and the RNG stream shifts, and every weight moves.
+``forward`` freezes the op order through routing, rotary positions, and the
+value residual. ``five_steps`` drives the real train step, so the objective,
+the drawn times and noise, the clip, AdamW's moments, and the EMA all reach
+the compared state -- a golden over a hand-rolled loop beside it would stop
+noticing when the recipe moved.
 
-Regenerate with ``BFB_REGENERATE=1``; a missing golden is minted AND fails,
-which is what forces someone to read it first.
+``forward`` and ``five_steps`` go through the harness, which randomizes the
+parameters and LOADS them on replay; that is why initialization cannot be one
+of them, since the load overwrites exactly what construction produced.
+Regenerate those two with ``BFB_REGENERATE=1``; a missing one is minted AND
+fails, which is what forces someone to read it first.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final, cast, override
+
+from torch import Tensor, nn
 
 import pytest
 import torch
 
-from torch import Tensor, nn
-
-from priml.baselines.speedrundit.model import SpeedrunDiT
+from priml.baselines.speedrundit.scripts.parity import (
+    GEOMETRY,
+    INIT_GOLDEN,
+    draw_inputs,
+    initialized_state,
+    native_config,
+)
 from priml.baselines.speedrundit.train_step import SpeedrunDiTTrainStep
+from priml.lib.custom_json import DictCodec
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.train.parallelism import NoParallel
 
 
+if TYPE_CHECKING:
+    from priml.baselines.speedrundit.model import SpeedrunDiT
+
+
 _CWD: Final = Path(__file__).parent.resolve()
 
-GRID: Final = 4
-CHANNELS: Final = 8
-HIDDEN: Final = 64
-HEADS: Final = 4
-LAYERS: Final = 6
-CLASSES: Final = 10
-TARGET: Final = 16
-BATCH: Final = 2
 STEPS: Final = 5
 
 
 def miniature() -> SpeedrunDiT.Config:
-    """Shrink the recipe without replacing its numerical choices.
+    """Shrink the recipe to the parity script's geometry, and nothing else.
 
     Cut: width, depth, heads, the latent grid, the class count, the projector
     widths. Kept: the routing ratios, the path-drop probability, the value
     residual, the rotary positions, the qk norms, the zeroed modulation, and
-    every initialization rule. Four heads rather than two because at batch two
-    a head axis of two would be indistinguishable from the batch axis, and a
-    transpose between them would not show up here.
+    every initialization rule.
 
     Returns:
       cfg: The golden geometry.
 
     """
-    cfg = SpeedrunDiT.Config()
-    cfg.channels_in = CHANNELS
-    cfg.channels_hidden = HIDDEN
-    cfg.image_size = GRID
-    cfg.patch_size = 1
-    cfg.num_layers = LAYERS
-    cfg.heads = HEADS
-    cfg.num_classes = CLASSES
-    cfg.projector_dims = (TARGET,)
-    cfg.projector_hidden = 32
-    return cfg
+    return native_config()
 
 
 def miniature_step() -> SpeedrunDiTTrainStep.Config:
-    """The golden geometry, wired into the recipe exp000 runs.
+    """Wire the golden geometry into the recipe exp000 runs.
 
     Size only. The optimizer, the clip, the EMA decay and the objective's
     weights are left as the recipe sets them, which is what the golden is for.
@@ -97,37 +93,11 @@ def build_input() -> dict[str, Tensor]:
     """Draw the fixed inputs every golden replays against.
 
     Returns:
-      batch: Latents, times, labels, and class features.
+      batch: Latents, times, labels, class features, and alignment targets.
 
     """
-    return {
-        "media": torch.randn(BATCH, CHANNELS, GRID, GRID),
-        "time": torch.rand(BATCH),
-        "label": torch.randint(CLASSES, (BATCH,)),
-        "cls_token": torch.randn(BATCH, TARGET),
-    }
-
-
-class _Init(nn.Module):
-    """Reports the initialized state as a tensor the harness can compare."""
-
-    def __init__(self, model: SpeedrunDiT) -> None:
-        super().__init__()
-        self.inner = model
-
-    def forward(self, _: Tensor) -> Tensor:
-        """Concatenate every parameter, in construction order.
-
-        Args:
-          _: Unused; the harness always passes an input.
-
-        Returns:
-          state: One float32 vector of every parameter.
-
-        """
-        return torch.cat(
-            [p.detach().float().flatten() for p in self.inner.parameters()],
-        )
+    classes = cast(int, GEOMETRY["num_classes"])
+    return draw_inputs(torch.Generator().manual_seed(0), classes=classes)
 
 
 class _Forward(nn.Module):
@@ -137,12 +107,14 @@ class _Forward(nn.Module):
         super().__init__()
         self.inner = model
 
+    @override
     def forward(
         self,
         media: Tensor,
         time: Tensor,
         label: Tensor,
         cls_token: Tensor,
+        features: Tensor,
     ) -> Tensor:
         """Run the model in eval mode and flatten its three outputs.
 
@@ -155,11 +127,13 @@ class _Forward(nn.Module):
           time: Fixed flow times.
           label: Fixed class indices.
           cls_token: Fixed class features.
+          features: Unused; the batch is shared with the training golden.
 
         Returns:
           output: Velocity, projections, and class velocity, concatenated.
 
         """
+        del features
         self.inner.eval()
         out = self.inner(media, time, label, cls_token)
         parts = [out.velocity.float().flatten(), out.cls_velocity.float().flatten()]
@@ -169,9 +143,7 @@ class _Forward(nn.Module):
 
 # Wrapping the TRAIN STEP rather than the model is what makes the golden cover
 # the recipe: the objective, the drawn times and noise, the clip, the schedule,
-# the EMA and AdamW's moments all reach the post-run state the harness compares.
-# It is also what lets the optimizer be built AFTER the harness randomizes
-# parameters, against those very tensors.
+# and AdamW's moments all reach the post-run weights the harness compares.
 class _FiveSteps(nn.Module):
     """Runs the real update five times and reports the trajectory."""
 
@@ -180,9 +152,11 @@ class _FiveSteps(nn.Module):
         self.step = config.make()
         self.inner = self.step.model
 
+    @override
     def forward(
         self,
         media: Tensor,
+        time: Tensor,
         label: Tensor,
         cls_token: Tensor,
         features: Tensor,
@@ -191,14 +165,17 @@ class _FiveSteps(nn.Module):
 
         Args:
           media: Fixed latents, reused every step.
+          time: Unused; the objective draws its own, which this freezes.
           label: Fixed class indices.
           cls_token: Fixed class features.
           features: Fixed alignment targets.
 
         Returns:
-          trajectory: The five losses, then every final weight.
+          trajectory: The five losses, then the EMA-averaged weights. The live
+          weights are the harness's post-run state, so they are not repeated.
 
         """
+        del time
         # Seeded here, not by the harness: the harness's seed covers parameter
         # randomization, and the times and noise this objective draws have to
         # be reproducible independently of how many parameters it drew for.
@@ -214,19 +191,41 @@ class _FiveSteps(nn.Module):
             loss = out["loss"]
             assert isinstance(loss, Tensor)
             pieces.append(loss.float().reshape(1))
-        pieces.extend(p.detach().float().flatten() for p in self.inner.parameters())
+        # The shadow lives on the step, which is not a module, so no state
+        # the harness compares would otherwise reach it.
+        with self.step.ema.apply_to(self.inner):
+            pieces.extend(p.detach().float().flatten() for p in self.inner.parameters())
         return torch.cat(pieces)
 
 
-def test_initialization_bfb() -> None:
-    """Freeze the construction order and every initialization rule."""
-    assert_bfb_against_golden(
-        golden_dir=_CWD / "testdata",
-        golden_name="speedrundit_init",
-        build_module=lambda: _Init(miniature().make()),
-        build_input=lambda: torch.zeros(1),
-        seed=0,
+def _assert_initialization(config: SpeedrunDiT.Config) -> None:
+    """Compare a construction with the reference's, tensor by tensor."""
+    expected = DictCodec.coerce(
+        cast(object, torch.load(_CWD / "testdata" / INIT_GOLDEN, weights_only=True)),
+        Tensor,
     )
+    actual = initialized_state(config.make)
+    assert actual.keys() == expected.keys()
+    for key, value in expected.items():
+        assert torch.equal(actual[key], value), f"initialization: {key}"
+        assert actual[key].dtype == value.dtype
+
+
+def test_source_initialization_golden() -> None:
+    """Every initialized tensor, and the RNG left behind, are the reference's."""
+    assert (_CWD / "testdata" / INIT_GOLDEN).is_file(), (
+        "Only scripts/parity.py --mint may mint this golden"
+    )
+    _assert_initialization(miniature())
+
+
+def test_source_initialization_golden_bites() -> None:
+    """A changed initialization constant must fail the comparison."""
+    cfg = miniature()
+    assert cfg.value_residual is not None
+    cfg.value_residual.initial = 0.25
+    with pytest.raises(AssertionError, match="value_residual"):
+        _assert_initialization(cfg)
 
 
 def test_forward_bfb() -> None:
@@ -242,28 +241,17 @@ def test_forward_bfb() -> None:
 
 @pytest.mark.compute_training
 def test_five_steps_bfb() -> None:
-    """Freeze the recipe: objective, draws, clip, EMA, and AdamW."""
-
-    def inputs() -> dict[str, Tensor]:
-        # No ``time``: the objective draws its own, which is part of what this
-        # golden freezes. The keys are the train step's parameters, because
-        # the harness spreads a dict input as keyword arguments.
-        batch = build_input()
-        del batch["time"]
-        batch["features"] = torch.randn(BATCH, 1 + GRID * GRID, TARGET)
-        return batch
-
+    """Freeze the recipe: objective, draws, clip, AdamW, and EMA."""
     assert_bfb_against_golden(
         golden_dir=_CWD / "testdata",
         golden_name="speedrundit_five_steps",
         build_module=lambda: _FiveSteps(miniature_step()),
-        build_input=inputs,
+        build_input=build_input,
         seed=42,
     )
 
 
-@pytest.mark.compute_training
-def test_the_golden_bites() -> None:
+def test_the_forward_golden_bites() -> None:
     """A golden nobody has seen fail is not evidence.
 
     Perturbs one parameter and asserts the comparison notices. Done through
@@ -271,18 +259,17 @@ def test_the_golden_bites() -> None:
     rather than a path built beside it.
     """
 
-    def perturbed(module: nn.Module, inp: Tensor) -> Tensor:
+    def perturbed(module: nn.Module, inputs: dict[str, Tensor]) -> Tensor:
         with torch.no_grad():
             next(iter(module.parameters())).add_(0.125)
-        assert isinstance(module, _Init)
-        return module(inp)
+        return cast(Tensor, module(**inputs))
 
     with pytest.raises(AssertionError):
         assert_bfb_against_golden(
             golden_dir=_CWD / "testdata",
-            golden_name="speedrundit_init",
-            build_module=lambda: _Init(miniature().make()),
-            build_input=lambda: torch.zeros(1),
+            golden_name="speedrundit_forward",
+            build_module=lambda: _Forward(miniature().make()),
+            build_input=build_input,
             seed=0,
             run=perturbed,
         )

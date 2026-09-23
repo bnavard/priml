@@ -6,25 +6,28 @@ exec uv --quiet --project "$(dirname "$0")" run --frozen --no-sync python3 "$0" 
 Measure this port against the pinned upstream SpeedrunDiT, bit for bit.
 
 Clones the reference at a pinned commit, imports it UNMODIFIED, and compares
-four checkpoints with exact tensor equality inside Priml's host-agnostic
-numeric context: the loader, initialization, one forward, the objective, and
-five optimizer steps.
+with exact tensor equality inside Priml's host-agnostic numeric context: the
+loader, initialization, five optimizer steps (times, noise, losses, every
+gradient, every weight), an eval forward with and without the sparse path, and
+the guided sampler.
 
-Nothing here is a unit test. It needs a network, a git clone, and several
-minutes, and it establishes the port ONCE against a moving upstream; the
-bit-for-bit goldens under ``testdata/`` are what keep it frozen afterwards. So
-this module is never imported by the library, and the library never imports it.
+Nothing here is a unit test. It needs a network, a git clone, and a minute,
+and it establishes the port ONCE against a moving upstream; the bit-for-bit
+goldens under ``testdata/`` are what keep it frozen afterwards. So this module
+is never imported by the library, and the library never imports it. The
+reference imports ``timm``, which Priml does not depend on, so the run supplies
+it for its own duration.
 
 The comparison is deliberately one-substitution: both sides run the same
 geometry, the same seed, and the same input tensors, and neither is adjusted
 to make the other agree. Where a difference is structural rather than
-numerical -- the port names value-residual parameters differently, and Priml's
-EMA declines to average frozen tensors -- it is REPORTED under its own heading
-rather than normalized away.
+numerical -- parameter names, and Priml's EMA declining to average frozen
+tensors -- it is REPORTED under its own heading rather than normalized away.
 
 Examples:
-  uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.parity  # noqa: E501
-  uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.parity --upstream /path/to/SpeedrunDiT  # noqa: E501
+  uv --quiet run --frozen --with timm python -m priml.baselines.speedrundit.scripts.parity  # noqa: E501
+  uv --quiet run --frozen --with timm python -m priml.baselines.speedrundit.scripts.parity --upstream /path/to/SpeedrunDiT  # noqa: E501
+
 '''
 # fmt: on
 
@@ -32,28 +35,33 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Protocol, cast
+from typing import TYPE_CHECKING, Final, Protocol, TypedDict, cast
 
 import argparse
+import copy
+import importlib
 import json
+import re
 import subprocess
 import sys
 import tempfile
 
-import numpy as np
-
 from torch import Tensor, nn
 
+import numpy as np
 import torch
 
 from priml.baselines.speedrundit.data import SpeedrunDiTData
 from priml.baselines.speedrundit.loss import SpeedrunDiTLoss
 from priml.baselines.speedrundit.model import SpeedrunDiT
+from priml.baselines.speedrundit.sampler import EulerMaruyamaSampler
 from priml.testing.bfb import host_agnostic_numerics
 
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Sequence
+    from collections.abc import Callable, Generator, Sequence
+
+    from torch.utils.data import Dataset
 
 
 SOURCE_URL: Final = "https://github.com/SwayStar123/SpeedrunDiT.git"
@@ -65,53 +73,189 @@ SOURCE_REVISION: Final = "c24c2ff25699cce63174ca56c2afcfeeb225e367"
 STEPS: Final = 5
 """Optimizer steps compared."""
 
-# Small enough to run in seconds, wide enough that no axis is degenerate: two
-# heads would hide a head-axis transpose, and a depth under five would drop
-# SPRINT's sparse stage entirely.
-GEOMETRY: Final = {
+# The goldens' geometry too, so what is minted is what was compared. Every
+# axis differs from every other it could be confused with -- batch 3 against
+# 2 heads, 3 latent channels against a 4-wide grid -- so a transpose between
+# any two cannot pass; a head of 8 gives the rotary ladder two rungs per axis
+# rather than the lone theta**0 a head of 4 would; and five layers is the
+# shallowest trunk that keeps a sparse SPRINT stage.
+GEOMETRY: Final[dict[str, object]] = {
     "input_size": 4,
     "patch_size": 1,
-    "in_channels": 8,
-    "hidden_size": 64,
-    "decoder_hidden_size": 64,
-    "depth": 6,
-    "num_heads": 4,
+    "in_channels": 3,
+    "hidden_size": 16,
+    "decoder_hidden_size": 16,
+    "depth": 5,
+    "num_heads": 2,
     "encoder_depth": 2,
     "num_classes": 10,
     "class_dropout_prob": 0.1,
     "use_cfg": True,
-    "z_dims": [16],
-    "projector_dim": 32,
-    "cls_token_dim": 16,
+    "z_dims": [6],
+    "projector_dim": 8,
+    "cls_token_dim": 6,
 }
+
+BATCH: Final = 3
+"""Samples per compared batch."""
+
+INIT_GOLDEN: Final = "source_init.pt"
+"""The initialization golden this script alone mints, under ``testdata/``."""
+
+SAMPLER_CLASSES: Final = 1000
+"""Classes for the sampler comparison: the reference hard-codes 1000 as its
+null label, so a smaller table would index past its end."""
+
+RENAMES: Final = (
+    (r"^sprint\.mask_token$", "mask_token"),
+    (r"^sprint\.fusion_proj\.", "fusion_proj."),
+    (r"\.attn\.value_residual\.weight$", ".attn.v1_lambda"),
+    (r"\.ffn\.", ".mlp."),
+    (r"\.modulation\.modulation\.", ".adaLN_modulation."),
+    (r"^cls_projector\.", "cls_projectors2."),
+    (r"^rope\.cos$", "feat_rope.freqs_cos"),
+    (r"^rope\.sin$", "feat_rope.freqs_sin"),
+)
+"""Port state names rewritten to the reference's; every other name agrees."""
 
 
 class _Flags(Protocol):
     """Parsed command line."""
 
     upstream: Path | None
-    keep: bool
+    mint: bool
 
 
-def native_config() -> SpeedrunDiT.Config:
-    """Build the port at the comparison geometry.
+class _Objective(Protocol):
+    """The reference's ``SILoss`` instance: seven terms per call."""
+
+    def __call__(
+        self,
+        model: nn.Module,
+        images: Tensor,
+        model_kwargs: dict[str, Tensor],
+        *,
+        zs: list[Tensor],
+        cls_token: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Apply to the input."""
+        ...
+
+
+class _ReferenceModules(Protocol):
+    """The reference modules this script reads, by name, from the clone."""
+
+    SiT: Callable[..., nn.Module]
+    SILoss: Callable[..., _Objective]
+    CustomDataset: Callable[[str], Dataset[tuple[Tensor, Tensor, Tensor]]]
+    euler_maruyama_sampler_path_drop: Callable[..., Tensor]
+
+
+class _Trace(TypedDict):
+    """One optimizer step, as both drivers record it."""
+
+    loss: Tensor
+    time: Tensor
+    noise: Tensor
+    grads: list[tuple[str, Tensor]]
+    weights: list[tuple[str, Tensor]]
+
+
+def upstream_module(name: str) -> _ReferenceModules:
+    """Import a module of the reference, which is on ``sys.path`` by now.
+
+    Args:
+      name: Module path inside the clone, e.g. ``"models.sit"``.
 
     Returns:
-      cfg: A config matching :data:`GEOMETRY`.
+      module: The module, typed as the members this script reads.
+
+    """
+    return cast(_ReferenceModules, importlib.import_module(name))
+
+
+def native_config(geometry: dict[str, object] = GEOMETRY) -> SpeedrunDiT.Config:
+    """Build the port at a comparison geometry.
+
+    Args:
+      geometry: The reference's constructor arguments.
+
+    Returns:
+      cfg: A config matching ``geometry``.
 
     """
     cfg = SpeedrunDiT.Config()
-    cfg.channels_in = GEOMETRY["in_channels"]
-    cfg.channels_hidden = GEOMETRY["hidden_size"]
-    cfg.image_size = GEOMETRY["input_size"]
-    cfg.patch_size = GEOMETRY["patch_size"]
-    cfg.num_layers = GEOMETRY["depth"]
-    cfg.heads = GEOMETRY["num_heads"]
-    cfg.num_classes = GEOMETRY["num_classes"]
-    cfg.class_dropout = GEOMETRY["class_dropout_prob"]
-    cfg.projector_dims = (GEOMETRY["z_dims"][0],)
-    cfg.projector_hidden = GEOMETRY["projector_dim"]
+    cfg.channels_in = cast(int, geometry["in_channels"])
+    cfg.channels_hidden = cast(int, geometry["hidden_size"])
+    cfg.image_size = cast(int, geometry["input_size"])
+    cfg.patch_size = cast(int, geometry["patch_size"])
+    cfg.num_layers = cast(int, geometry["depth"])
+    cfg.heads = cast(int, geometry["num_heads"])
+    cfg.num_classes = cast(int, geometry["num_classes"])
+    cfg.label_embedder.dropout = cast(float, geometry["class_dropout_prob"])
+    cfg.projector_dims = (cast(list[int], geometry["z_dims"])[0],)
+    cfg.projector_hidden = cast(int, geometry["projector_dim"])
     return cfg
+
+
+def upstream_name(name: str) -> str:
+    """Translate a port parameter name to the reference's.
+
+    Args:
+      name: A name from the port's ``named_parameters``.
+
+    Returns:
+      name: The reference's name for the same tensor.
+
+    """
+    for pattern, replacement in RENAMES:
+        name = re.sub(pattern, replacement, name)
+    return name
+
+
+def build_pair(
+    geometry: dict[str, object],
+    seed: int,
+) -> tuple[nn.Module, SpeedrunDiT]:
+    """Construct the reference and the port under one seed.
+
+    Args:
+      geometry: The reference's constructor arguments.
+      seed: Global seed both constructions start from.
+
+    Returns:
+      reference: The reference model.
+      candidate: The port.
+
+    """
+    torch.manual_seed(seed)
+    upstream = upstream_module("models.sit").SiT(
+        qk_norm=True,
+        fused_attn=True,
+        **geometry,
+    )
+    torch.manual_seed(seed)
+    return upstream, native_config(geometry).make()
+
+
+def perturb(reference: nn.Module, candidate: SpeedrunDiT) -> None:
+    """Add the same noise to both models' weights, matched by name.
+
+    Zero-initialized readouts and modulations make a freshly built model
+    output exactly zero, which a wrong trunk would reproduce as well.
+
+    Args:
+      reference: The reference model.
+      candidate: The port.
+
+    """
+    generator = torch.Generator().manual_seed(5)
+    by_name = dict(reference.named_parameters())
+    with torch.no_grad():
+        for name, parameter in candidate.named_parameters():
+            noise = 0.05 * torch.randn(parameter.shape, generator=generator)
+            parameter.add_(noise)
+            by_name[upstream_name(name)].add_(noise)
 
 
 @contextmanager
@@ -203,12 +347,14 @@ def compare_named(
     right: Sequence[tuple[str, Tensor]],
     label: str,
 ) -> bool:
-    """Compare two parameter lists positionally.
+    """Compare two parameter lists by name, through :data:`RENAMES`.
 
-    Positional rather than by name: the port names value-residual parameters
-    ``attn.value_residual.weight`` where the reference names them
-    ``attn.v1_lambda``, and the construction order is the thing under test, so
-    position is the honest key.
+    By name rather than by position: the reference's root owns ``mask_token``
+    and ``pos_embed`` directly, and ``named_parameters`` yields a module's own
+    parameters before any child's, while the port keeps the mask token with
+    the routing that uses it. That swap involves only the frozen table, which
+    never has a gradient; the order of the tensors that do is asserted by
+    :func:`compare_trainable_order`.
 
     Args:
       left: Reference ``(name, tensor)`` pairs.
@@ -219,24 +365,41 @@ def compare_named(
       ok: Whether every tensor matched.
 
     """
-    if len(left) != len(right):
-        return report(
-            label,
-            ok=False,
-            detail=f"{len(left)} tensors against {len(right)}",
-        )
+    reference = dict(left)
+    candidate = {upstream_name(name): value for name, value in right}
+    unmatched = sorted(set(reference) ^ set(candidate))
+    if unmatched:
+        return report(label, ok=False, detail=f"unmatched names: {unmatched[:4]}")
     bad: list[str] = []
-    for (left_name, left_value), (right_name, right_value) in zip(
-        left,
-        right,
-        strict=True,
-    ):
-        ok, detail = tensors_equal(left_value, right_value)
+    for name, value in reference.items():
+        ok, detail = tensors_equal(value, candidate[name])
         if not ok:
-            bad.append(f"{left_name} vs {right_name}: {detail}")
+            bad.append(f"{name}: {detail}")
     if bad:
         return report(label, ok=False, detail=f"{len(bad)} differ; first: {bad[0]}")
     return report(label, ok=True)
+
+
+def compare_trainable_order(reference: nn.Module, candidate: nn.Module) -> bool:
+    """Compare the order of the parameters that receive gradients.
+
+    The gradient clip reduces one norm over the gradients in this order, so
+    two orders are two float reductions of the same terms.
+
+    Args:
+      reference: The reference model.
+      candidate: The port.
+
+    Returns:
+      ok: Whether the orders agree.
+
+    """
+    left = [n for n, p in reference.named_parameters() if p.requires_grad]
+    right = [
+        upstream_name(n) for n, p in candidate.named_parameters() if p.requires_grad
+    ]
+    first = next((a for a, b in zip(left, right, strict=False) if a != b), "")
+    return report("trainable parameter order", left == right, f"first: {first}")
 
 
 def synthetic_corpus(root: Path, *, count: int) -> None:
@@ -253,14 +416,44 @@ def synthetic_corpus(root: Path, *, count: int) -> None:
     latents.mkdir(parents=True)
     labels: list[list[object]] = []
     rng = np.random.default_rng(0)
+    size = cast(int, GEOMETRY["input_size"])
+    channels = cast(int, GEOMETRY["in_channels"])
     for index in range(count):
         stem = f"{index:08d}"
-        np.save(images / f"img{stem}.npy", rng.integers(0, 255, (3, 4, 4), np.uint8))
-        latent = rng.standard_normal((1, 8, 4, 4)).astype(np.float32)
+        image = rng.integers(0, 255, (3, size, size), np.uint8)
+        np.save(images / f"img{stem}.npy", image)
+        latent = rng.standard_normal((1, channels, size, size)).astype(np.float32)
         np.save(latents / f"img-latents-{stem}.npy", latent)
         labels.append([f"00000/img-latents-{stem}.npy", index % 10])
     manifest = {"labels": labels}
     (root / "vae-in" / "dataset.json").write_text(json.dumps(manifest), "utf-8")
+    # The port reads its class-token targets from disk where the reference
+    # encodes them each step; the reference's loader never looks at this file.
+    width = cast(list[int], GEOMETRY["z_dims"])[0]
+    np.save(root / "cls_token.npy", rng.standard_normal((count, width), np.float32))
+
+
+def draw_inputs(generator: torch.Generator, *, classes: int) -> dict[str, Tensor]:
+    """Draw one batch at :data:`GEOMETRY`, for both sides to consume.
+
+    Args:
+      generator: The stream to draw from.
+      classes: Label range.
+
+    Returns:
+      batch: Latents, times, labels, class tokens, and alignment targets.
+
+    """
+    size = cast(int, GEOMETRY["input_size"])
+    channels = cast(int, GEOMETRY["in_channels"])
+    width = cast(list[int], GEOMETRY["z_dims"])[0]
+    return {
+        "media": torch.randn(BATCH, channels, size, size, generator=generator),
+        "time": torch.rand(BATCH, generator=generator),
+        "label": torch.randint(classes, (BATCH,), generator=generator),
+        "cls_token": torch.randn(BATCH, width, generator=generator),
+        "features": torch.randn(BATCH, 1 + size * size, width, generator=generator),
+    }
 
 
 def compare_loader(upstream: Path) -> bool:
@@ -285,7 +478,7 @@ def compare_loader(upstream: Path) -> bool:
         root = Path(name)
         synthetic_corpus(root, count=count)
         sys.path.insert(0, str(upstream))
-        dataset = __import__("dataset").CustomDataset(str(root))
+        dataset = upstream_module("dataset").CustomDataset(str(root))
         loader = DataLoader(dataset, batch_size=count, shuffle=False)
         raw_image, latent, label = next(iter(loader))
 
@@ -301,21 +494,10 @@ def compare_loader(upstream: Path) -> bool:
         data = config.make()
         batch = next(iter(data.eval_dataloader()))
 
-        ok = report("order and labels", *_swap(tensors_equal(label, batch["label"])))
-        ok &= report(
-            "latents",
-            *_swap(tensors_equal(latent.squeeze(1), batch["media"])),
-        )
-        ok &= report(
-            "images",
-            *_swap(tensors_equal(raw_image, batch["raw_image"])),
-        )
-        return ok
-
-
-def _swap(result: tuple[bool, str]) -> tuple[bool, str]:
-    """Adapt ``tensors_equal`` to :func:`report`'s argument order."""
-    return result
+        ok = report("order and labels", *tensors_equal(label, batch["label"]))
+        ok &= report("latents", *tensors_equal(latent.squeeze(1), batch["media"]))
+        assert "raw_image" in batch
+        return ok & report("images", *tensors_equal(raw_image, batch["raw_image"]))
 
 
 def build_batches(count: int) -> list[dict[str, Tensor]]:
@@ -329,20 +511,14 @@ def build_batches(count: int) -> list[dict[str, Tensor]]:
 
     """
     generator = torch.Generator().manual_seed(99)
-    batches: list[dict[str, Tensor]] = []
-    for _ in range(count):
-        batches.append(
-            {
-                "media": torch.randn(2, 8, 4, 4, generator=generator),
-                "label": torch.randint(10, (2,), generator=generator),
-                "cls_token": torch.randn(2, 16, generator=generator),
-                "features": torch.randn(2, 17, 16, generator=generator),
-            },
-        )
-    return batches
+    classes = cast(int, GEOMETRY["num_classes"])
+    return [draw_inputs(generator, classes=classes) for _ in range(count)]
 
 
-def run_upstream(model: nn.Module, batches: Sequence[dict[str, Tensor]]) -> list[dict]:
+def run_upstream(
+    model: nn.Module,
+    batches: Sequence[dict[str, Tensor]],
+) -> list[_Trace]:
     """Drive the reference for :data:`STEPS` optimizer steps.
 
     Args:
@@ -353,9 +529,7 @@ def run_upstream(model: nn.Module, batches: Sequence[dict[str, Tensor]]) -> list
       trace: Per-step losses, gradients, and post-step weights.
 
     """
-    from loss import SILoss  # noqa: PLC0415 -- Script-local, from the clone.
-
-    objective = SILoss(
+    objective = upstream_module("loss").SILoss(
         path_type="linear",
         weighting="uniform",
         cfm_weighting="uniform",
@@ -370,7 +544,7 @@ def run_upstream(model: nn.Module, batches: Sequence[dict[str, Tensor]]) -> list
         eps=1e-8,
     )
     model.train()
-    trace: list[dict] = []
+    trace: list[_Trace] = []
     for batch in batches:
         denoise, proj, time, noise, cls, cfm, _cfm_cls = objective(
             model,
@@ -380,10 +554,7 @@ def run_upstream(model: nn.Module, batches: Sequence[dict[str, Tensor]]) -> list
             cls_token=batch["cls_token"],
         )
         loss = (
-            denoise.mean()
-            + 0.5 * proj.mean()
-            + 0.03 * cls.mean()
-            + 0.05 * cfm.mean()
+            denoise.mean() + 0.5 * proj.mean() + 0.03 * cls.mean() + 0.05 * cfm.mean()
         )
         loss.backward()
         grads = [
@@ -408,7 +579,10 @@ def run_upstream(model: nn.Module, batches: Sequence[dict[str, Tensor]]) -> list
     return trace
 
 
-def run_native(model: SpeedrunDiT, batches: Sequence[dict[str, Tensor]]) -> list[dict]:
+def run_native(
+    model: SpeedrunDiT,
+    batches: Sequence[dict[str, Tensor]],
+) -> list[_Trace]:
     """Drive the port for :data:`STEPS` optimizer steps.
 
     Args:
@@ -428,7 +602,7 @@ def run_native(model: SpeedrunDiT, batches: Sequence[dict[str, Tensor]]) -> list
         eps=1e-8,
     )
     model.train()
-    trace: list[dict] = []
+    trace: list[_Trace] = []
     for batch in batches:
         result = objective(
             model,
@@ -460,6 +634,139 @@ def run_native(model: SpeedrunDiT, batches: Sequence[dict[str, Tensor]]) -> list
     return trace
 
 
+def compare_forward(reference: nn.Module, candidate: SpeedrunDiT) -> bool:
+    """Compare one eval forward, with the sparse path kept and dropped.
+
+    Eval runs the middle stage dense and ``uncond`` discards it, which are
+    the two routes the training steps above never take.
+
+    Args:
+      reference: The reference model, perturbed.
+      candidate: The port, perturbed identically.
+
+    Returns:
+      ok: Whether every output matched.
+
+    """
+    print("eval forward")
+    batch = draw_inputs(
+        torch.Generator().manual_seed(3),
+        classes=cast(int, GEOMETRY["num_classes"]),
+    )
+    media, time, label = batch["media"], batch["time"], batch["label"]
+    cls_token = batch["cls_token"]
+    reference.eval()
+    candidate.eval()
+    ok = True
+    for uncond in (False, True):
+        left = cast(
+            tuple[Tensor, list[Tensor], Tensor],
+            reference(media, time, label, cls_token=cls_token, uncond=uncond),
+        )
+        right = candidate(media, time, label, cls_token, uncond=uncond)
+        pairs = [(left[0], right.velocity), (left[2], right.cls_velocity)]
+        pairs.extend(zip(left[1], right.projections, strict=True))
+        for name, (a, b) in zip(("velocity", "cls", "projection"), pairs, strict=False):
+            ok &= report(f"uncond={uncond} {name}", *tensors_equal(a, b))
+    return ok
+
+
+def compare_sampler() -> bool:
+    """Compare guided sampling with the reference's FID sampler.
+
+    Four steps with guidance on an interval that excludes the first, so the
+    guided branch, the unguided branch, and the final deterministic step are
+    all reached.
+
+    Returns:
+      ok: Whether both streams' samples matched.
+
+    """
+    sampler = upstream_module("samplers").euler_maruyama_sampler_path_drop
+    print("sampler")
+    geometry = {**GEOMETRY, "num_classes": SAMPLER_CLASSES}
+    reference, candidate = build_pair(geometry, seed=1234)
+    perturb(reference, candidate)
+    reference.eval()
+    candidate.eval()
+    batch = draw_inputs(torch.Generator().manual_seed(8), classes=SAMPLER_CLASSES)
+    media, label, cls_token = batch["media"], batch["label"], batch["cls_token"]
+    guidance, high = 2.5, 0.85
+    args = argparse.Namespace(
+        time_shifting=True,
+        shift_base=4096,
+        cls_cfg_scale=guidance,
+    )
+
+    torch.manual_seed(11)
+    left = sampler(
+        reference,
+        media,
+        label,
+        num_steps=4,
+        cfg_scale=guidance,
+        guidance_high=high,
+        cls_latents=cls_token,
+        args=args,
+    ).to(torch.float32)
+    config = EulerMaruyamaSampler.Config(num_steps=4, guidance=guidance)
+    config.guidance_interval = (0.0, high)
+    torch.manual_seed(11)
+    right = config.make()(candidate, media, label, cls_token)
+    return report("guided latents", *tensors_equal(left, right.media))
+
+
+def initialized_state(build: Callable[[], nn.Module]) -> dict[str, Tensor]:
+    """Construct a model exactly as the initialization golden replays it.
+
+    Seed zero on a forked stream, inside host-agnostic numerics, and the
+    stream's state afterwards alongside the tensors: a construction that drew
+    a different NUMBER of values fails even where the tensors it kept agree.
+
+    Args:
+      build: Constructs the model.
+
+    Returns:
+      state: The ``state_dict``, plus the RNG state under ``"rng"``.
+
+    """
+    with torch.random.fork_rng(devices=[]), host_agnostic_numerics():
+        torch.default_generator.manual_seed(0)
+        state = dict(build().state_dict())
+        state["rng"] = torch.get_rng_state()
+    return state
+
+
+def compare_initialization(golden: Path | None) -> bool:
+    """Compare both constructions, and mint the golden from the reference.
+
+    Minted from the REFERENCE, never the port, under the port's state names:
+    the golden then freezes what the pinned commit initializes, and the port
+    passes it only by agreeing.
+
+    Args:
+      golden: Where to write the golden, or ``None`` to compare only.
+
+    Returns:
+      ok: Whether every tensor and the RNG state matched.
+
+    """
+    build = upstream_module("models.sit").SiT
+    reference = initialized_state(
+        lambda: build(qk_norm=True, fused_attn=True, **GEOMETRY),
+    )
+    candidate = initialized_state(lambda: native_config().make())
+    ok = compare_named(
+        list(reference.items()),
+        list(candidate.items()),
+        "state and RNG",
+    )
+    if ok and golden is not None:
+        torch.save({name: reference[upstream_name(name)] for name in candidate}, golden)
+        print(f"  minted {golden}")
+    return ok
+
+
 def main() -> int:
     """Run every comparison and report.
 
@@ -478,9 +785,9 @@ def main() -> int:
         help="Existing reference checkout; omit to clone the pinned commit.",
     )
     parser.add_argument(
-        "--keep",
+        "--mint",
         action="store_true",
-        help="Print every differing tensor rather than the first.",
+        help=f"Write the reference's initialization to testdata/{INIT_GOLDEN}.",
     )
     flags = cast(_Flags, parser.parse_args())
 
@@ -491,17 +798,20 @@ def main() -> int:
         sys.path.insert(0, str(upstream))
         ok = compare_loader(upstream)
 
-        from models.sit import SiT  # noqa: PLC0415 -- Script-local, from the clone.
-
         print("initialization")
-        torch.manual_seed(1234)
-        reference = SiT(qk_norm=True, fused_attn=True, **GEOMETRY)
-        torch.manual_seed(1234)
-        candidate = native_config().make()
+        testdata = Path(__file__).resolve().parents[1] / "testdata"
+        ok &= compare_initialization(testdata / INIT_GOLDEN if flags.mint else None)
+        reference, candidate = build_pair(GEOMETRY, seed=1234)
         ok &= compare_named(
             list(reference.named_parameters()),
             list(candidate.named_parameters()),
             "parameters after init",
+        )
+        ok &= compare_trainable_order(reference, candidate)
+        # Kept pristine for the forward below; the steps move the originals.
+        reference_eval, candidate_eval = (
+            copy.deepcopy(reference),
+            copy.deepcopy(candidate),
         )
 
         batches = build_batches(STEPS)
@@ -515,15 +825,20 @@ def main() -> int:
 
         for index, (a, b) in enumerate(zip(left, right, strict=True), start=1):
             for key in ("time", "noise", "loss"):
-                same = tensors_equal(a[key], b[key])
-                ok &= report(f"step {index} {key}", *_swap(same))
+                ok &= report(f"step {index} {key}", *tensors_equal(a[key], b[key]))
             ok &= compare_named(a["grads"], b["grads"], f"step {index} gradients")
             ok &= compare_named(a["weights"], b["weights"], f"step {index} weights")
 
+        perturb(reference_eval, candidate_eval)
+        with host_agnostic_numerics():
+            ok &= compare_forward(reference_eval, candidate_eval)
+            ok &= compare_sampler()
+
     print()
     print("known structural differences, not normalized away:")
-    print("  - value-residual parameters are named attn.value_residual.weight")
-    print("    here and attn.v1_lambda upstream; compared positionally.")
+    print("  - parameter names differ (see RENAMES), and the root's frozen")
+    print("    pos_embed enumerates before the mask token rather than after;")
+    print("    tensors are compared by name, trainable order separately.")
     print("  - Priml's EMA declines to average frozen tensors, so the shadow")
     print("    of pos_embed does not drift as the reference's does. The model")
     print("    weights above are unaffected; the EMA shadow is not compared.")

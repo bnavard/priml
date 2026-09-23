@@ -20,6 +20,7 @@ Examples:
   uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --help  # noqa: E501
   uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --synthetic --samples 64  # noqa: E501
   uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --verify --source /data/imagenet256  # noqa: E501
+
 '''
 # fmt: on
 
@@ -35,7 +36,11 @@ import tempfile
 
 import numpy as np
 
-from priml.baselines.speedrundit.data import SpeedrunDiTData, relative_names
+from priml.baselines.speedrundit.data import (
+    SpeedrunDiTData,
+    read_labels,
+    relative_names,
+)
 from priml.train.train_loop import TrainLoop
 
 
@@ -111,8 +116,8 @@ def verify(directory: Path) -> int:
                 f"{len(image_names)} images against {len(latent_names)} "
                 "latents; the trees are paired by position.",
             )
-    labels = dict(json.loads(manifest.read_text(encoding="utf-8"))["labels"])
-    missing = [name for name in latent_names if name.replace("\\", "/") not in labels]
+    labels = read_labels(manifest)
+    missing = [name for name in latent_names if name not in labels]
     if missing:
         raise ValueError(
             f"{len(missing)} latents have no label; first is {missing[0]}.",

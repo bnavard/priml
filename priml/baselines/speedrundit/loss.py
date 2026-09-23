@@ -27,6 +27,7 @@ References:
     Yu et al. 2024, "Representation Alignment for Generation" (REPA).
   https://arxiv.org/abs/2506.05350
     Stoica et al. 2025, "Contrastive Flow Matching."
+
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ from torch import Tensor
 import torch
 
 from priml.cost import Cost, elementwise_cost, map_cost, reduction_cost, set_cost
+from priml.math.custom_types import TensorFn
 from priml.math.diffusion import (
     compute_log_alpha,
     log_sigma_from_log_snr_per_rectified_flow,
@@ -54,7 +56,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from priml.baselines.speedrundit.model import SpeedrunDiT
-    from priml.math.custom_types import TensorFn
 
 
 __all__ = [
@@ -63,6 +64,7 @@ __all__ = [
     "SpeedrunDiTLoss",
     "TimeSamplerFn",
     "TimeTransformFn",
+    "as_callable",
     "cosine_path",
     "linear_path",
     "linear_time_weight",
@@ -170,7 +172,7 @@ def linear_path(t: Tensor) -> Interpolant:
 
 
 def rectified_flow_path(t: Tensor) -> Interpolant:
-    """The straight path, through Priml's log-SNR schedule.
+    """Walk the straight path through Priml's log-SNR schedule instead.
 
     Args:
       t: Flow times.
@@ -273,7 +275,9 @@ def resolution_time_shift(
     elements = 1
     for dim in shape:
         elements *= dim
-    shift = math.sqrt(elements / base)
+    # Correctly rounded, as the reference computes it: ``** 0.5`` is a libm
+    # ``pow`` and lands on a different last bit for some element counts.
+    shift = math.sqrt(elements / base)  # noqa: TID251
     return torch.clamp((shift * t) / (1 + (shift - 1) * t), 0.0, 1.0)
 
 
@@ -425,13 +429,13 @@ class SpeedrunDiTLoss:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.interpolant = config.interpolant
-        self.time_sampler = _as_callable(config.time_sampler)
-        self.time_transform = (
+        self.time_sampler: TimeSamplerFn = as_callable(config.time_sampler)
+        self.time_transform: TimeTransformFn | None = (
             None
             if config.time_transform is None
-            else _as_callable(config.time_transform)
+            else as_callable(config.time_transform)
         )
-        self.cfm_weight = _as_callable(config.cfm_weight)
+        self.cfm_weight: TensorFn = as_callable(config.cfm_weight)
 
     def __call__(
         self,
@@ -554,8 +558,16 @@ class SpeedrunDiTLoss:
         return total / (len(features) * batch)
 
 
-def _as_callable[T](slot: Makeable[T] | T) -> T:
-    """Build a slot holding a config, or pass a callable through."""
+def as_callable[T](slot: Makeable[T] | T) -> T:
+    """Build a slot holding a config, or pass a callable through.
+
+    Args:
+      slot: A config such as a ``PartialConfig``, or the callable itself.
+
+    Returns:
+      callable: What the slot holds, built if it was a config.
+
+    """
     if isinstance(slot, Makeable):
         # ``Makeable`` is runtime-checkable, so isinstance erases its type
         # parameter: ``make`` reads as returning ``object`` without the cast.

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Final
+from typing import Final, cast
+
+from torch import Tensor
 
 import pytest
 import torch
-
-from torch import Tensor
 
 from priml.baselines.speedrundit.train_step import SpeedrunDiTTrainStep
 from priml.train.parallelism import NoParallel
@@ -76,6 +76,7 @@ def test_a_step_reports_the_contract_keys() -> None:
     out = step.train_step(**batch())
     assert isinstance(out["loss"], Tensor)
     assert isinstance(out["model"], Tensor)
+    assert "metrics" in out
     assert set(out["metrics"]) == {
         "denoising",
         "cls",
@@ -113,13 +114,41 @@ def test_gradients_are_cleared_between_steps() -> None:
     assert all(p.grad is None for p in step.model.parameters())
 
 
-def test_the_loss_falls_over_a_few_steps() -> None:
-    """The recipe has to actually optimize, at any size."""
+def test_training_lowers_the_objective_on_fixed_draws() -> None:
+    """The recipe has to actually optimize, at any size.
+
+    Scored before and after on PINNED times and noise, in eval mode. Each step
+    draws fresh times, and the loss varies more across times than six updates
+    move it, so comparing the steps' own losses measures which times happened
+    to be drawn rather than whether anything was learned.
+    """
     torch.manual_seed(0)
     step = tiny_step()
     fixed = batch()
-    losses = [float(step.train_step(**fixed)["loss"]) for _ in range(6)]
-    assert losses[-1] < losses[0]
+    generator = torch.Generator().manual_seed(1)
+    pinned = {
+        "time": torch.rand(BATCH, 1, 1, 1, generator=generator),
+        "noise": torch.randn(BATCH, CHANNELS, GRID, GRID, generator=generator),
+        "noise_cls": torch.randn(BATCH, TARGET, generator=generator),
+    }
+
+    def score() -> float:
+        step.model.eval()
+        with torch.no_grad():
+            result = step.objective(
+                step.model,
+                media=cast(Tensor, fixed["media"]),
+                label=cast(Tensor, fixed["label"]),
+                cls_token=cast(Tensor, fixed["cls_token"]),
+                features=cast(list[Tensor], fixed["features"]),
+                **pinned,
+            )
+        return float(result.loss)
+
+    before = score()
+    for _ in range(6):
+        _ = step.train_step(**fixed)
+    assert score() < before
 
 
 def test_the_frozen_position_table_never_moves() -> None:

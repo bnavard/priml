@@ -13,11 +13,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypedDict, cast
 
-import torch
-import torch.distributed as dist
-
 from configgle import Fig
 from torch import Tensor
+
+import torch
+import torch.distributed as dist
 
 from priml.lib.custom_json import FloatCodec
 
@@ -66,7 +66,7 @@ class VelocityError:
         rows = min(rows, errors.numel())
         if rows <= 0:
             return
-        # Summed, not meaned per batch: batches differ in width, and a mean of
+        # Summed, not meant per batch: batches differ in width, and a mean of
         # batch means would weight a short final batch like a full one.
         self._total += float(errors[:rows].sum())
         self._count += rows

@@ -7,12 +7,17 @@ tests are what keep that true.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
+
+import importlib
+import re
+import typing
+
+from configgle import apply_overrides
+from configgle.testing import assert_pprint_golden
 
 import pytest
 import torch
-
-from configgle.testing import assert_pprint_golden
 
 from priml.baselines.speedrundit import experiments
 from priml.baselines.speedrundit.data import SpeedrunDiTData
@@ -24,10 +29,13 @@ from priml.baselines.speedrundit.experiments import (
 from priml.baselines.speedrundit.metric import VelocityError
 from priml.baselines.speedrundit.model import SpeedrunDiT
 from priml.baselines.speedrundit.train_step import SpeedrunDiTTrainStep
+from priml.train.parallelism import NoParallel
 from priml.train.train_loop import TrainLoop
 
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from priml.testing.experiments import ExperimentFactory
 
 
@@ -36,7 +44,9 @@ LADDER: Final[list[ExperimentFactory[SpeedrunDiTLoop]]] = [exp000, exp_smoke]
 
 
 @pytest.mark.parametrize("factory", LADDER, ids=[f.__name__ for f in LADDER])
-def test_every_experiment_finalizes(factory: ExperimentFactory) -> None:
+def test_every_experiment_finalizes(
+    factory: ExperimentFactory[SpeedrunDiTLoop],
+) -> None:
     """A recipe must resolve without a corpus or a device."""
     config = factory().copy_tree().finalize()
     assert config.study_name == "speedrundit"
@@ -45,22 +55,22 @@ def test_every_experiment_finalizes(factory: ExperimentFactory) -> None:
 
 @pytest.mark.parametrize("factory", LADDER, ids=[f.__name__ for f in LADDER])
 def test_construction_reads_no_files(
-    factory: ExperimentFactory,
+    factory: ExperimentFactory[SpeedrunDiTLoop],
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: object,
 ) -> None:
     """Building and finalizing a config must touch no disk.
 
     A recipe that reads the corpus at config time cannot be inspected on a
     machine that has not staged it, which is most machines.
     """
-    del tmp_path
+    monkeypatch.chdir(tmp_path)
 
-    def refuse(*args: object, **kwargs: object) -> object:
-        message = "config construction must not read files"
-        raise AssertionError(message)
+    def boom(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("config construction must not read files")
 
-    monkeypatch.setattr(torch, "load", refuse)
+    monkeypatch.setattr(torch, "load", boom)
     _ = factory().copy_tree().finalize()
 
 
@@ -79,7 +89,8 @@ def test_the_loop_narrows_both_slots() -> None:
 
 def test_exp000_builds_a_train_loop_not_its_own_config_class() -> None:
     """``Makes["TrainLoop"]`` retargets ``make``; the class name is the
-    config's, not the product's."""
+    config's, not the product's.
+    """
     assert SpeedrunDiTLoop.parent_class is TrainLoop
 
 
@@ -95,7 +106,7 @@ def test_exp000_matches_the_reference_geometry() -> None:
     assert (model.image_size, model.patch_size) == (16, 1)
     assert (model.num_layers, model.heads) == (12, 12)
     assert model.num_classes == 1000
-    assert model.class_dropout == 0.1
+    assert model.label_embedder.dropout == 0.1
     assert model.projector_dims == (768,)
     assert model.projector_hidden == 2048
     assert cfg.dataset.batch_size == 256
@@ -173,7 +184,8 @@ def test_smoke_keeps_the_sparse_stage() -> None:
 
 def test_smoke_runs_without_autocast_or_compile() -> None:
     """Both are CPU traps: bf16 autocast hits a transposed-matmul cliff and
-    compile charges Dynamo tracing for a four-step run."""
+    compile charges Dynamo tracing for a four-step run.
+    """
     cfg = exp_smoke()
     assert cfg.step.dtype_autocast is None
     assert cfg.step.compile is None
@@ -181,7 +193,8 @@ def test_smoke_runs_without_autocast_or_compile() -> None:
 
 def test_forks_do_not_mutate_their_parent() -> None:
     """A factory returns a fresh tree; a fork editing its parent would make
-    the ladder order-dependent."""
+    the ladder order-dependent.
+    """
     first = exp000()
     _ = exp_smoke()
     second = exp000()
@@ -205,6 +218,68 @@ def test_published_experiments_document_themselves() -> None:
 def test_the_module_pins_the_reference_commit() -> None:
     """The goldens are only meaningful against a named commit."""
     assert "c24c2ff25699cce63174ca56c2afcfeeb225e367" in (experiments.__doc__ or "")
+
+
+def _configs() -> list[type]:
+    """Collect every Config class this baseline defines.
+
+    Returns:
+      configs: The loop's, then each module's, in definition order.
+
+    """
+    found: list[type] = [SpeedrunDiTLoop]
+    for name in ("data", "loss", "metric", "model", "sampler", "train_step"):
+        module = importlib.import_module(f"priml.baselines.speedrundit.{name}")
+        for value in cast(dict[str, object], vars(module)).values():
+            config = cast(object, getattr(value, "Config", None))
+            if (
+                isinstance(value, type)
+                and value.__module__ == module.__name__
+                and isinstance(config, type)
+            ):
+                found.append(config)
+    return found
+
+
+CONFIGS: Final = _configs()
+
+
+@pytest.mark.parametrize("config", CONFIGS, ids=[c.__qualname__ for c in CONFIGS])
+def test_every_field_annotation_resolves_at_runtime(config: type) -> None:
+    """``--override`` resolves each node's annotations as it walks the path.
+
+    A type imported only under ``TYPE_CHECKING`` passes every static check
+    and then raises ``NameError`` the first time a launch overrides a field
+    beneath that node.
+    """
+    assert typing.get_type_hints(config)
+
+
+def test_the_launcher_can_override_the_step() -> None:
+    """Where the step runs is environment, which ``--override`` exists for."""
+    config = exp_smoke()
+    apply_overrides(config, ["step.parallelism.device=cpu"])
+    assert isinstance(config.step.parallelism, NoParallel.Config)
+    assert config.step.parallelism.device == "cpu"
+
+
+def test_the_smoke_corpus_command_matches_the_smoke_model() -> None:
+    """The documented preparation must write what ``exp_smoke`` reads.
+
+    ``prepare_data``'s own defaults are exp000's geometry, so a smoke run
+    over a corpus prepared without these flags fails at the first forward.
+    """
+    pairs = cast(
+        list[tuple[str, str]],
+        re.findall(r"--([a-z-]+) (\d+)", exp_smoke.__doc__ or ""),
+    )
+    flags = dict(pairs)
+    model = exp_smoke().step.model
+    assert int(flags["latent-size"]) == model.image_size
+    assert int(flags["latent-channels"]) == model.channels_in
+    assert int(flags["num-classes"]) == model.num_classes
+    assert int(flags["encoder-width"]) == model.projector_dims[0]
+    assert int(flags["samples"]) >= exp_smoke().dataset.batch_size
 
 
 @pytest.mark.compute_large_fixture
