@@ -21,10 +21,6 @@ def test_default_directory_matches_the_loader(tmp_path: Path) -> None:
 
     If they drift, a successful preparation is followed by a run that cannot
     find what it just wrote.
-
-    Args:
-      tmp_path: Unused; present so a stray write would be visible.
-
     """
     del tmp_path
     config = SpeedrunDiTData.Config()

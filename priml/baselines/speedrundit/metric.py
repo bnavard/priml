@@ -1,17 +1,12 @@
-"""Evaluation metric for SR-DiT: mean velocity error over the eval corpus.
+"""Mean velocity error on held-out latents, the eval cadence's own question.
 
-Deliberately not FID. A distributional score needs a full sampling pass, an
-INVAE decode, and a 50k reference batch, none of which belong inside the train
-loop's eval cadence; that lives in ``scripts/`` and is run against a
-checkpoint. What this metric answers is the question an eval every ten
-thousand steps should answer -- is the velocity field still improving on held-
-out latents -- at the cost of one forward.
+Not a distributional score: FID needs a full sampling pass, an INVAE decode
+and a 50k reference batch, which belong to a script run against a checkpoint
+rather than to an eval every ten thousand steps. This costs one forward and
+answers whether the field is still improving.
 
-The per-sample error arrives as the step's ``model`` output rather than as
-logits, which is what a generative recipe has instead of class scores. Padding
-rows are excluded by ``valid_count`` rather than averaged in as zeros, which
-would otherwise pull the mean toward zero in proportion to how short the final
-batch was.
+A generative recipe has no class scores, so the per-sample error arrives as
+the step's ``model`` output where a classifier would send logits.
 """
 
 from __future__ import annotations
@@ -64,10 +59,15 @@ class VelocityError:
         """
         valid = batch.get("valid_count")
         errors = logits.detach().flatten()
+        # Padding rows are dropped, not averaged in: their error is zero, so
+        # counting them would pull the mean down in proportion to how short
+        # the final batch happened to be.
         rows = int(valid) if isinstance(valid, int) else errors.numel()
         rows = min(rows, errors.numel())
         if rows <= 0:
             return
+        # Summed, not meaned per batch: batches differ in width, and a mean of
+        # batch means would weight a short final batch like a full one.
         self._total += float(errors[:rows].sum())
         self._count += rows
 

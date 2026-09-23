@@ -314,15 +314,7 @@ def compare_loader(upstream: Path) -> bool:
 
 
 def _swap(result: tuple[bool, str]) -> tuple[bool, str]:
-    """Adapt ``tensors_equal`` to :func:`report`'s argument order.
-
-    Args:
-      result: ``(ok, detail)``.
-
-    Returns:
-      arguments: The same pair, for splatting into :func:`report`.
-
-    """
+    """Adapt ``tensors_equal`` to :func:`report`'s argument order."""
     return result
 
 

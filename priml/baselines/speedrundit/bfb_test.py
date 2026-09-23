@@ -7,9 +7,10 @@ run on CPU in the ordinary suite and are what catch a regression afterwards.
 Three goldens, because they fail for different reasons. ``init`` freezes the
 construction order -- reorder two submodules and the RNG stream shifts, and
 every weight moves. ``forward`` freezes the op order through routing, rotary
-positions, and the value residual. ``five_steps`` freezes the recipe: the
-objective, the drawn times and noise, the gradients, the clip, and AdamW's
-moments all reach the compared post-state.
+positions, and the value residual. ``five_steps`` drives the real train step,
+so the objective, the drawn times and noise, the clip, the EMA and AdamW's
+moments all reach the compared post-state -- a golden over a hand-rolled loop
+beside it would stop noticing when the recipe moved.
 
 Regenerate with ``BFB_REGENERATE=1``; a missing golden is minted AND fails,
 which is what forces someone to read it first.
@@ -25,9 +26,10 @@ import torch
 
 from torch import Tensor, nn
 
-from priml.baselines.speedrundit.loss import SpeedrunDiTLoss
 from priml.baselines.speedrundit.model import SpeedrunDiT
+from priml.baselines.speedrundit.train_step import SpeedrunDiTTrainStep
 from priml.testing.bfb import assert_bfb_against_golden
+from priml.train.parallelism import NoParallel
 
 
 _CWD: Final = Path(__file__).parent.resolve()
@@ -67,6 +69,27 @@ def miniature() -> SpeedrunDiT.Config:
     cfg.num_classes = CLASSES
     cfg.projector_dims = (TARGET,)
     cfg.projector_hidden = 32
+    return cfg
+
+
+def miniature_step() -> SpeedrunDiTTrainStep.Config:
+    """The golden geometry, wired into the recipe exp000 runs.
+
+    Size only. The optimizer, the clip, the EMA decay and the objective's
+    weights are left as the recipe sets them, which is what the golden is for.
+
+    Returns:
+      cfg: A train step at the golden geometry.
+
+    """
+    cfg = SpeedrunDiTTrainStep.Config()
+    cfg.model = miniature()
+    cfg.train_budget_steps = STEPS
+    cfg.parallelism = NoParallel.Config(device="cpu")
+    # fp32 on CPU: autograd's weight-gradient matmul has no bf16 kernel for the
+    # transposed layout on most hosts and falls back to a scalar loop.
+    cfg.dtype_autocast = None
+    cfg.compile = None
     return cfg
 
 
@@ -114,7 +137,13 @@ class _Forward(nn.Module):
         super().__init__()
         self.inner = model
 
-    def forward(self, batch: dict[str, Tensor]) -> Tensor:
+    def forward(
+        self,
+        media: Tensor,
+        time: Tensor,
+        label: Tensor,
+        cls_token: Tensor,
+    ) -> Tensor:
         """Run the model in eval mode and flatten its three outputs.
 
         Eval mode deliberately: routing, label dropout and path drop are all
@@ -122,72 +151,69 @@ class _Forward(nn.Module):
         rather than an arithmetic.
 
         Args:
-          batch: Fixed inputs.
+          media: Fixed latents.
+          time: Fixed flow times.
+          label: Fixed class indices.
+          cls_token: Fixed class features.
 
         Returns:
           output: Velocity, projections, and class velocity, concatenated.
 
         """
         self.inner.eval()
-        out = self.inner(
-            batch["media"],
-            batch["time"],
-            batch["label"],
-            batch["cls_token"],
-        )
+        out = self.inner(media, time, label, cls_token)
         parts = [out.velocity.float().flatten(), out.cls_velocity.float().flatten()]
         parts.extend(p.float().flatten() for p in out.projections)
         return torch.cat(parts)
 
 
+# Wrapping the TRAIN STEP rather than the model is what makes the golden cover
+# the recipe: the objective, the drawn times and noise, the clip, the schedule,
+# the EMA and AdamW's moments all reach the post-run state the harness compares.
+# It is also what lets the optimizer be built AFTER the harness randomizes
+# parameters, against those very tensors.
 class _FiveSteps(nn.Module):
-    """Runs the real recipe for five updates and reports the trajectory.
+    """Runs the real update five times and reports the trajectory."""
 
-    Wrapping rather than passing the model directly is what lets the optimizer
-    be built AFTER the harness randomizes parameters, against those very
-    tensors; an optimizer built earlier would hold a discarded model's.
-    """
-
-    def __init__(self, model: SpeedrunDiT) -> None:
+    def __init__(self, config: SpeedrunDiTTrainStep.Config) -> None:
         super().__init__()
-        self.inner = model
+        self.step = config.make()
+        self.inner = self.step.model
 
-    def forward(self, batch: dict[str, Tensor]) -> Tensor:
+    def forward(
+        self,
+        media: Tensor,
+        label: Tensor,
+        cls_token: Tensor,
+        features: Tensor,
+    ) -> Tensor:
         """Take five updates and concatenate what each produced.
 
         Args:
-          batch: Fixed inputs, reused every step.
+          media: Fixed latents, reused every step.
+          label: Fixed class indices.
+          cls_token: Fixed class features.
+          features: Fixed alignment targets.
 
         Returns:
-          trajectory: Losses, gradient norms, and the final weights.
+          trajectory: The five losses, then every final weight.
 
         """
-        objective = SpeedrunDiTLoss.Config().make()
-        optimizer = torch.optim.AdamW(
-            self.inner.parameters(),
-            lr=1e-4,
-            betas=(0.9, 0.999),
-            weight_decay=0.0,
-            eps=1e-8,
-        )
-        self.inner.train()
+        # Seeded here, not by the harness: the harness's seed covers parameter
+        # randomization, and the times and noise this objective draws have to
+        # be reproducible independently of how many parameters it drew for.
         torch.manual_seed(4242)
         pieces: list[Tensor] = []
         for _ in range(STEPS):
-            result = objective(
-                self.inner,
-                media=batch["media"],
-                label=batch["label"],
-                cls_token=batch["cls_token"],
-                features=[batch["features"]],
+            out = self.step.train_step(
+                media=media,
+                label=label,
+                cls_token=cls_token,
+                features=[features],
             )
-            result.loss.backward()
-            norm = nn.utils.clip_grad_norm_(self.inner.parameters(), 1.0)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
-            pieces.append(result.loss.detach().float().reshape(1))
-            pieces.append(result.time.detach().float().flatten())
-            pieces.append(norm.detach().float().reshape(1))
+            loss = out["loss"]
+            assert isinstance(loss, Tensor)
+            pieces.append(loss.float().reshape(1))
         pieces.extend(p.detach().float().flatten() for p in self.inner.parameters())
         return torch.cat(pieces)
 
@@ -216,17 +242,21 @@ def test_forward_bfb() -> None:
 
 @pytest.mark.compute_training
 def test_five_steps_bfb() -> None:
-    """Freeze the recipe: objective, draws, gradients, clip, and AdamW."""
+    """Freeze the recipe: objective, draws, clip, EMA, and AdamW."""
 
     def inputs() -> dict[str, Tensor]:
+        # No ``time``: the objective draws its own, which is part of what this
+        # golden freezes. The keys are the train step's parameters, because
+        # the harness spreads a dict input as keyword arguments.
         batch = build_input()
+        del batch["time"]
         batch["features"] = torch.randn(BATCH, 1 + GRID * GRID, TARGET)
         return batch
 
     assert_bfb_against_golden(
         golden_dir=_CWD / "testdata",
         golden_name="speedrundit_five_steps",
-        build_module=lambda: _FiveSteps(miniature().make()),
+        build_module=lambda: _FiveSteps(miniature_step()),
         build_input=inputs,
         seed=42,
     )

@@ -11,25 +11,14 @@ after the fact:
   the batch neighbour's velocity, so minimizing the total pushes the field away
   from what the neighbour wants.
 
-Every axis the reference selects with a mode string is a slot here: the
-interpolant, the time distribution, the time reparameterization, and the
-contrastive weighting are injected callables, so a variant is a different VALUE
-rather than a branch this module has to learn.
-
-On reusing ``priml.math.diffusion``
-    The schedule family there is exact and is the right home for this
-    mathematics in general, but it is parameterized on log-SNR:
-    ``log_snr_from_log_time_per_logit`` maps ``t`` through a logit and
-    ``log_sigma_from_log_snr_per_rectified_flow`` maps back through a sigmoid,
-    so recovering ``sigma`` costs a logit/sigmoid round trip. The reference
-    writes ``alpha = 1 - t`` and ``sigma = t`` directly. The two agree to well
-    under a float32 ULP and are NOT bit-identical, and this baseline's contract
-    is bit-for-bit parity with the reference, so the interpolant stays in time
-    space here. ``target_rectified_flow``'s own target, ``eps - x``, IS
-    reproduced exactly by ``-1 * x + 1 * eps``, which is what the linear path
-    below computes; the rest of that function derives ``x_clean``/``eps_clean``
-    from log-SNR, which nothing on the training path reads. The sampler, whose
-    numerics are not pinned to the reference, does use the shared machinery.
+Four things vary independently, so each is a slot rather than a mode string:
+``interpolant`` (the path between data and noise), ``time_sampler`` (where
+along it a step lands), ``time_transform`` (how that time is reparameterized
+for the resolution), and ``cfm_weight`` (what the contrastive term costs at
+each time). Two interpolants ship: :func:`linear_path`, which writes
+``alpha = 1 - t`` directly, and :func:`rectified_flow_path`, which routes
+through :mod:`priml.math.diffusion`'s log-SNR schedule. They compute one
+function and differ in the last bits.
 
 References:
   https://arxiv.org/abs/2209.03003
@@ -43,36 +32,43 @@ References:
 from __future__ import annotations
 
 from dataclasses import KW_ONLY, field
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
 import math
 
-from configgle import Fig, PartialConfig
+from configgle import Fig, Makeable, PartialConfig
 from torch import Tensor
 
 import torch
 
 from priml.cost import Cost, elementwise_cost, map_cost, reduction_cost, set_cost
+from priml.math.diffusion import (
+    compute_log_alpha,
+    log_sigma_from_log_snr_per_rectified_flow,
+    log_snr_from_log_time_per_logit,
+)
+from priml.math.probability import random_logit_normal
 
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from configgle import Makeable
-
     from priml.baselines.speedrundit.model import SpeedrunDiT
+    from priml.math.custom_types import TensorFn
 
 
 __all__ = [
     "Interpolant",
     "InterpolantFn",
     "SpeedrunDiTLoss",
+    "TimeSamplerFn",
     "TimeTransformFn",
     "cosine_path",
     "linear_path",
     "linear_time_weight",
     "logit_normal_time",
     "mean_flat",
+    "rectified_flow_path",
     "resolution_time_shift",
     "uniform_time",
     "uniform_time_weight",
@@ -142,12 +138,24 @@ class TimeTransformFn(Protocol):
         ...
 
 
+class TimeSamplerFn(Protocol):
+    """Draws the flow times one step lands on."""
+
+    def __call__(self, batch: int) -> Tensor:
+        """Draw one step's times.
+
+        Args:
+          batch: Samples per step.
+
+        Returns:
+          t: ``[batch, 1, 1, 1]`` times in ``[0, 1)``.
+
+        """
+        ...
+
+
 def linear_path(t: Tensor) -> Interpolant:
     """Straight path between data and noise: ``x_t = (1 - t) x + t eps``.
-
-    The derivatives are Python integers, not tensors, exactly as the reference
-    writes them: ``-1 * x + 1 * eps`` is an exact negation followed by an exact
-    subtraction, so the velocity target carries no rounding of its own.
 
     Args:
       t: Flow times.
@@ -156,7 +164,33 @@ def linear_path(t: Tensor) -> Interpolant:
       interpolant: ``(1 - t, t, -1, 1)``.
 
     """
+    # Integer derivatives, not tensors: ``-1 * x + 1 * eps`` is an exact
+    # negation and an exact subtraction, so the target carries no rounding.
     return Interpolant(alpha=1 - t, sigma=t, d_alpha=-1, d_sigma=1)
+
+
+def rectified_flow_path(t: Tensor) -> Interpolant:
+    """The straight path, through Priml's log-SNR schedule.
+
+    Args:
+      t: Flow times.
+
+    Returns:
+      interpolant: ``(1 - t, t, -1, 1)``, reached through log-SNR.
+
+    """
+    # Same function as ``linear_path``, off by the last bits: a logit into a
+    # sigmoid rounds twice where ``1 - t`` rounds once. Inject this when
+    # upstream parity is not the point.
+    log_snr = log_snr_from_log_time_per_logit(t.log())
+    log_sigma = log_sigma_from_log_snr_per_rectified_flow(log_snr)
+    log_alpha = compute_log_alpha(log_snr, log_sigma)
+    return Interpolant(
+        alpha=torch.exp(log_alpha),
+        sigma=torch.exp(log_sigma),
+        d_alpha=-1,
+        d_sigma=1,
+    )
 
 
 def cosine_path(t: Tensor) -> Interpolant:
@@ -185,9 +219,6 @@ def uniform_time(
 ) -> Tensor:
     """Draw flow times uniformly on ``[0, 1)``.
 
-    Drawn on the CPU default generator and shaped ``[batch, 1, 1, 1]``, which
-    is what the reference does; the device move happens once, afterwards.
-
     Args:
       batch: Samples per step.
       generator: Optional generator; ``None`` uses the CPU default stream.
@@ -196,26 +227,25 @@ def uniform_time(
       t: ``[batch, 1, 1, 1]`` times.
 
     """
+    # Drawn on the CPU stream, not the batch's device: that is where the
+    # reference draws, and the device move happens once, afterwards.
     return torch.rand((batch, 1, 1, 1), generator=generator)
 
 
-def logit_normal_time(
-    batch: int,
-    *,
-    generator: torch.Generator | None = None,
-) -> Tensor:
+def logit_normal_time(batch: int) -> Tensor:
     """Draw flow times from a logit-normal, concentrating mass mid-path.
 
     Args:
       batch: Samples per step.
-      generator: Optional generator; ``None`` uses the CPU default stream.
 
     Returns:
       t: ``[batch, 1, 1, 1]`` times.
 
     """
-    sigma = torch.randn((batch, 1, 1, 1), generator=generator).exp()
-    return sigma / (1 + sigma)
+    # The reference spells this ``exp(z) / (1 + exp(z))``, which is
+    # ``sigmoid(z)`` off by the last bits. Off the parity path either way:
+    # the pinned recipe draws uniformly.
+    return random_logit_normal(batch, 1, 1, 1)
 
 
 def resolution_time_shift(
@@ -314,16 +344,16 @@ class SpeedrunDiTLoss:
         interpolant: InterpolantFn = linear_path
         """Probability path between data and noise."""
 
-        time_sampler: Makeable[object] | object = uniform_time
+        time_sampler: Makeable[TimeSamplerFn] | TimeSamplerFn = uniform_time
         """Draws the per-sample flow times."""
 
-        time_transform: Makeable[object] | object | None = field(
+        time_transform: Makeable[TimeTransformFn] | TimeTransformFn | None = field(
             default_factory=lambda: PartialConfig(resolution_time_shift, base=4096),
         )
         """Reparameterizes time before the path is evaluated; ``None`` leaves
         the sampled times alone."""
 
-        cfm_weight: object = uniform_time_weight
+        cfm_weight: Makeable[TensorFn] | TensorFn = uniform_time_weight
         """Per-time weight on the contrastive term."""
 
         projection_coeff: float = 0.5
@@ -524,15 +554,10 @@ class SpeedrunDiTLoss:
         return total / (len(features) * batch)
 
 
-def _as_callable(slot: object) -> object:
-    """Resolve a slot that may hold a config or a plain callable.
-
-    Args:
-      slot: A ``Makeable`` or an already-callable value.
-
-    Returns:
-      fn: The callable the slot denotes.
-
-    """
-    make = getattr(slot, "make", None)
-    return slot if make is None else make()
+def _as_callable[T](slot: Makeable[T] | T) -> T:
+    """Build a slot holding a config, or pass a callable through."""
+    if isinstance(slot, Makeable):
+        # ``Makeable`` is runtime-checkable, so isinstance erases its type
+        # parameter: ``make`` reads as returning ``object`` without the cast.
+        return cast(T, slot.make())
+    return slot

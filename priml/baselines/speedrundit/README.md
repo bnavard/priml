@@ -68,20 +68,37 @@ Two structural differences are **reported rather than normalized away**:
   `p * 0.9999 + p * 0.0001` is not `p` in float32, so its shadow drifts by
   rounding. Model weights are unaffected; the EMA shadow is not compared.
 
-### Why some of `priml.math.diffusion` is not on the training path
+### What comes from `priml.math.diffusion`
 
-The schedule family there is parameterized on log-SNR:
-`log_snr_from_log_time_per_logit` maps `t` through a logit and
-`log_sigma_from_log_snr_per_rectified_flow` maps back through a sigmoid, so
-recovering `sigma` costs a round trip. The reference writes `alpha = 1 - t`
-and `sigma = t` directly. The two agree far below a float32 ULP and are not
-bit-identical, and this baseline's contract is exact parity, so the
-interpolant stays in time space in `loss.py`. `target_rectified_flow`'s own
-target, `eps - x`, *is* reproduced exactly by the linear path's `-1 * x + 1 * eps`.
+| Piece | Where |
+|---|---|
+| `ddpm_ddim` — the posterior step, `eta` between DDIM and DDPM | `sampler.py`, every step of both streams |
+| `target_rectified_flow` — decomposes `v` into clean signal and noise | `sampler.py`, as `ddpm_ddim`'s default and an injectable slot |
+| `log_sigma_from_log_snr_per_rectified_flow` | `sampler.py`, the corruption slot |
+| `log_snr_from_log_time_per_logit` / `log_time_from_log_snr_per_logit` | `sampler.py`, building the grid and recovering `t` for the model |
+| `compute_log_alpha` | `loss.py`, inside `rectified_flow_path` |
+| `random_logit_normal` (`priml.math.probability`) | `loss.py`, `logit_normal_time` is exactly this |
 
-`priml.math.diffusion.sample` is not used by `sampler.py` for a structural
-reason rather than a numerical one: it threads a single state tensor, and this
-model diffuses a latent and a class token jointly on a shared time grid.
+The sampler writes the **loop** and not the step. `sample_iter` threads one
+`x_curr`; this model carries a latent and a class token that share a time grid
+and each feed the other's velocity, so they advance together in eight lines
+here. The derived part — the DDPM posterior, the `log1mexp` formulation that
+stays stable as sigma vanishes, the `eta` interpolation — is all reused.
+
+The one place the shared schedule is **not** the default is the training-time
+interpolant, and both forms ship:
+
+- `rectified_flow_path` routes through `log_snr_from_log_time_per_logit` into
+  `log_sigma_from_log_snr_per_rectified_flow`.
+- `linear_path` writes `alpha = 1 - t`, `sigma = t` directly.
+
+They compute the same function and differ in the last bits, because the
+logit/sigmoid round trip rounds twice where `1 - t` rounds once. `linear_path`
+is the default **only** because this baseline's contract is bit-for-bit parity
+with the pinned reference, which writes the straight form. Drop that contract
+and the shared schedule is the better default — which is why both are values
+in the same slot rather than a branch. `loss_test.py` asserts both halves:
+they agree to `1e-6`, and they are not bitwise equal.
 
 ## Layout
 

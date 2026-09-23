@@ -1,24 +1,21 @@
-"""Euler--Maruyama sampling of the SR-DiT velocity field.
+"""Generation: integrate the learned velocity from noise back to data.
 
-On not using ``priml.math.diffusion.sample``
-    That driver carries ONE state tensor: ``sample_iter`` threads a single
-    ``x_curr`` through ``model_fn`` and ``onestep_fn``. This model diffuses two
-    coupled streams -- the latent and the class token -- which share a time
-    grid and have to advance together, because the class token is an input to
-    the velocity the latent reads. Packing them into one tensor would mean
-    reshaping at every step and unpacking inside the model, which buys nothing
-    and hides the coupling. So the loop is written here, and the shared
-    driver stays the right answer for the single-stream case it serves.
+The step is :func:`priml.math.diffusion.ddpm_ddim` at its own defaults -- this
+model predicts ``v = eps - x``, which is what ``target_rectified_flow``
+decomposes, and rectified flow is already that function's partner corruption.
+``eta`` chooses between a deterministic DDIM trajectory and the full DDPM
+posterior.
 
-    What IS reused is the path itself: the drift below is expressed through
-    the same :class:`~priml.baselines.speedrundit.loss.InterpolantFn` the
-    objective trains against, so a change of path moves both together instead
-    of leaving the sampler integrating a curve the model was never fit to.
+What is written here is the loop, because this model carries two coupled
+streams: the latent and the class token share a time grid and each feeds the
+other's velocity, so they advance together. Time is carried as ``log_snr`` and
+handed back to the model as ``t`` through the schedule's stated inverse.
 
 References:
+  https://arxiv.org/abs/2010.02502
+    Song et al. 2020, "Denoising Diffusion Implicit Models" (the eta family).
   https://arxiv.org/abs/2401.08740
-    Ma et al. 2024, "SiT: Exploring Flow and Diffusion-based Generative
-    Models with Scalable Interpolant Transformers", Section 4 on SDE sampling.
+    Ma et al. 2024, "SiT", Section 4 on SDE sampling.
 """
 
 from __future__ import annotations
@@ -30,10 +27,14 @@ import torch
 
 from configgle import Fig
 
-from priml.baselines.speedrundit.loss import (
-    InterpolantFn,
-    linear_path,
-    resolution_time_shift,
+from priml.baselines.speedrundit.loss import resolution_time_shift
+from priml.math.diffusion import (
+    TargetFn,
+    ddpm_ddim,
+    log_sigma_from_log_snr_per_rectified_flow,
+    log_snr_from_log_time_per_logit,
+    log_time_from_log_snr_per_logit,
+    target_rectified_flow,
 )
 
 
@@ -41,13 +42,14 @@ if TYPE_CHECKING:
     from torch import Tensor
 
     from priml.baselines.speedrundit.model import SpeedrunDiT
+    from priml.math.custom_types import TensorableFn
 
 
 __all__ = ["EulerMaruyamaSampler"]
 
 
 class EulerMaruyamaSampler:
-    """Integrates the learned velocity backwards from noise to data."""
+    """Integrates the learned velocity from noise to data."""
 
     class Output(NamedTuple):
         """One sampling run."""
@@ -66,19 +68,26 @@ class EulerMaruyamaSampler:
         num_steps: int = 250
         """Integration steps; the reported FID is measured at this count."""
 
-        last_step: float = 0.04
-        """Time the uniform grid stops at before the final jump to zero.
+        last_time: float = 0.04
+        """Time the grid stops at. Zero is unreachable: ``log_snr`` there is
+        infinite, and the drift is stiffest in the last steps anyway."""
 
-        Integrating all the way to zero on a uniform grid spends its last and
-        largest steps where the drift is stiffest; stopping short and taking
-        one exact step to zero is what keeps the tail stable."""
+        eta: float = 1.0
+        """Stochasticity: zero is DDIM, one is the DDPM posterior."""
 
-        interpolant: InterpolantFn = linear_path
-        """Probability path; must match the one the model was trained on."""
+        target_fn: TargetFn = target_rectified_flow
+        """Decomposes the model output into clean signal and noise.
+
+        Must agree with what the model was trained to predict; this one reads
+        a velocity, which is what the objective's default path targets."""
+
+        corruption_fn: TensorableFn = log_sigma_from_log_snr_per_rectified_flow
+        """Maps log SNR to log sigma; the path's own corruption rule."""
 
         time_shift_base: int | None = 4096
         """Element count at which the time shift is the identity; ``None``
-        disables shifting."""
+        disables shifting. Must match the objective's, or the sampler walks a
+        curve the model was never fit to."""
 
         guidance: float = 1.0
         """Classifier-free guidance strength; one disables the second pass."""
@@ -96,29 +105,32 @@ class EulerMaruyamaSampler:
     def __init__(self, config: Config) -> None:
         self.config = config
 
-    def times(self, shape: tuple[int, ...], device: torch.device) -> Tensor:
-        """Build the descending time grid.
+    def log_snr(self, shape: tuple[int, ...], device: torch.device) -> Tensor:
+        """Build the descending log-SNR grid.
 
         Args:
           shape: Shape of one sample, without the batch axis.
           device: Device the grid is built on.
 
         Returns:
-          times: ``[num_steps + 1]`` float64 times from one down to zero.
+          log_snr: ``[num_steps + 1]``, increasing as time descends.
 
         """
         cfg = self.config
-        grid = torch.linspace(
+        times = torch.linspace(
             1.0,
-            cfg.last_step,
+            cfg.last_time,
             cfg.num_steps,
             dtype=torch.float64,
             device=device,
         )
-        grid = torch.cat([grid, grid.new_zeros(1)])
         if cfg.time_shift_base is not None:
-            grid = resolution_time_shift(grid, shape=shape, base=cfg.time_shift_base)
-        return grid
+            times = resolution_time_shift(
+                times,
+                shape=shape,
+                base=cfg.time_shift_base,
+            )
+        return log_snr_from_log_time_per_logit(times.log())
 
     @torch.no_grad()
     def __call__(
@@ -130,11 +142,6 @@ class EulerMaruyamaSampler:
     ) -> Output:
         """Integrate from noise to data.
 
-        The state is carried in float64 while the model is called in its own
-        dtype: the accumulation runs for hundreds of steps and is the caller's,
-        so it is stated here rather than inherited from whatever the model
-        happens to emit.
-
         Args:
           model: The trained velocity field.
           media: Initial latent noise, ``[batch, channels, size, size]``.
@@ -142,54 +149,70 @@ class EulerMaruyamaSampler:
           cls_token: Initial class-token noise, ``[batch, channels_cls]``.
 
         Returns:
-          output: The integrated latent and class token, in ``media``'s dtype.
+          output: The integrated latent and class token.
+
+        """
+        grid = self.log_snr(tuple(media.shape[1:]), media.device)
+        latent, cls = media, cls_token
+        steps = grid.shape[0] - 1
+
+        for index in range(steps):
+            curr, following = grid[index], grid[index + 1]
+            time = self._times(curr, latent.shape[0], latent.dtype, latent.device)
+            velocity, velocity_cls = self._velocity(model, latent, time, label, cls)
+            # The final step takes the posterior mean and adds no noise, as
+            # Ho et al. prescribe; every earlier one is stochastic.
+            noisy = index < steps - 1
+            latent = self._advance(velocity, latent, curr, following, noisy=noisy)
+            cls = self._advance(velocity_cls, cls, curr, following, noisy=noisy)
+        return EulerMaruyamaSampler.Output(media=latent, cls_token=cls)
+
+    def _advance(
+        self,
+        velocity: Tensor,
+        state: Tensor,
+        log_snr_curr: Tensor,
+        log_snr_next: Tensor,
+        *,
+        noisy: bool,
+    ) -> Tensor:
+        """Take one shared diffusion step.
+
+        Args:
+          velocity: The model's prediction for this stream.
+          state: Current noisy state.
+          log_snr_curr: Log SNR now.
+          log_snr_next: Log SNR after the step.
+          noisy: Whether to add the step's sampling noise.
+
+        Returns:
+          state: The advanced state.
 
         """
         cfg = self.config
-        dtype = media.dtype
-        grid = self.times(tuple(media.shape[1:]), media.device)
-        state = media.double()
-        state_cls = cls_token.double()
-
-        for current, following in zip(grid[:-1], grid[1:], strict=True):
-            step = following - current
-            time = torch.full(
-                (state.shape[0],),
-                float(current),
-                device=state.device,
-                dtype=dtype,
-            )
-            velocity, velocity_cls = self._velocity(
-                model,
-                state.to(dtype),
-                time,
-                label,
-                state_cls.to(dtype),
-            )
-            # Reverse-time diffusion coefficient of the variance-exploding SDE
-            # that shares this path's marginals.
-            diffusion = 2 * current.clamp_min(0)
-            drift = velocity.double() - 0.5 * diffusion * self._score(
-                state,
-                velocity.double(),
-                current,
-            )
-            drift_cls = velocity_cls.double() - 0.5 * diffusion * self._score(
-                state_cls,
-                velocity_cls.double(),
-                current,
-            )
-            state = state + drift * step
-            state_cls = state_cls + drift_cls * step
-            if following > 0:
-                scale = (diffusion * step.abs()).sqrt()
-                state = state + scale * torch.randn_like(state)
-                state_cls = state_cls + scale * torch.randn_like(state_cls)
-
-        return EulerMaruyamaSampler.Output(
-            media=state.to(dtype),
-            cls_token=state_cls.to(dtype),
+        _, mean, log_std = ddpm_ddim(
+            velocity,
+            state,
+            log_snr_curr,
+            log_snr_next,
+            corruption_fn=cfg.corruption_fn,
+            target_fn=cfg.target_fn,
+            eta=cfg.eta,
         )
+        if not noisy:
+            return mean
+        return mean + torch.exp(log_std) * torch.randn_like(state)
+
+    def _times(
+        self,
+        log_snr: Tensor,
+        batch: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tensor:
+        """Recover the flow time the model was conditioned on."""
+        time = log_time_from_log_snr_per_logit(log_snr).exp()
+        return torch.full((batch,), float(time), dtype=dtype, device=device)
 
     def _velocity(
         self,
@@ -199,11 +222,7 @@ class EulerMaruyamaSampler:
         label: Tensor,
         cls_token: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        """Evaluate the velocity, optionally with guidance.
-
-        Guidance runs two separate forwards rather than one doubled batch,
-        because the unconditional branch also drops SPRINT's sparse path and
-        the two therefore take different routes through the model.
+        """Evaluate both velocities, optionally with guidance.
 
         Args:
           model: The trained velocity field.
@@ -220,31 +239,11 @@ class EulerMaruyamaSampler:
         conditional = model(media, time, label, cls_token)
         if not self.config.uses_guidance:
             return conditional.velocity, conditional.cls_velocity
+        # Two forwards, not one doubled batch: the unconditional branch also
+        # discards the sparse path, so the two take different routes.
         unconditional = model(media, time, label, cls_token, uncond=True)
-        strength = self.config.guidance
-        blend = lambda cond, uncond: uncond + strength * (cond - uncond)  # noqa: E731
+        weight = self.config.guidance
         return (
-            blend(conditional.velocity, unconditional.velocity),
-            blend(conditional.cls_velocity, unconditional.cls_velocity),
+            torch.lerp(unconditional.velocity, conditional.velocity, weight),
+            torch.lerp(unconditional.cls_velocity, conditional.cls_velocity, weight),
         )
-
-    def _score(self, state: Tensor, velocity: Tensor, time: Tensor) -> Tensor:
-        """Recover the score from a velocity prediction.
-
-        Args:
-          state: Current state.
-          velocity: Predicted velocity at ``time``.
-          time: Current time.
-
-        Returns:
-          score: The gradient of the log density at ``state``.
-
-        """
-        path = self.config.interpolant(time)
-        alpha = torch.as_tensor(path.alpha, dtype=state.dtype, device=state.device)
-        sigma = torch.as_tensor(path.sigma, dtype=state.dtype, device=state.device)
-        d_alpha = torch.as_tensor(path.d_alpha, dtype=state.dtype, device=state.device)
-        d_sigma = torch.as_tensor(path.d_sigma, dtype=state.dtype, device=state.device)
-        ratio = d_alpha / alpha
-        variance = sigma**2 * ratio - d_sigma * sigma
-        return (ratio * state - velocity) / variance

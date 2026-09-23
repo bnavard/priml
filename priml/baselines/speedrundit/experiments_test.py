@@ -37,12 +37,7 @@ LADDER: Final[list[ExperimentFactory[SpeedrunDiTLoop]]] = [exp000, exp_smoke]
 
 @pytest.mark.parametrize("factory", LADDER, ids=[f.__name__ for f in LADDER])
 def test_every_experiment_finalizes(factory: ExperimentFactory) -> None:
-    """A recipe must resolve without a corpus or a device.
-
-    Args:
-      factory: One experiment factory.
-
-    """
+    """A recipe must resolve without a corpus or a device."""
     config = factory().copy_tree().finalize()
     assert config.study_name == "speedrundit"
     assert config.experiment_name == factory.__name__
@@ -58,12 +53,6 @@ def test_construction_reads_no_files(
 
     A recipe that reads the corpus at config time cannot be inspected on a
     machine that has not staged it, which is most machines.
-
-    Args:
-      factory: One experiment factory.
-      monkeypatch: Fixture used to make loading raise.
-      tmp_path: Unused; present so the working directory is disposable.
-
     """
     del tmp_path
 

@@ -19,6 +19,7 @@ from priml.baselines.speedrundit.loss import (
     linear_time_weight,
     logit_normal_time,
     mean_flat,
+    rectified_flow_path,
     resolution_time_shift,
     uniform_time,
 )
@@ -87,6 +88,30 @@ def test_linear_path_endpoints() -> None:
     assert torch.equal(linear_path(zero).sigma, torch.zeros(1))
     assert torch.equal(linear_path(one).alpha, torch.zeros(1))
     assert torch.equal(linear_path(one).sigma, torch.ones(1))
+
+
+def test_the_shared_schedule_agrees_with_the_straight_form() -> None:
+    """``rectified_flow_path`` and ``linear_path`` compute one function.
+
+    They agree far below a float32 ULP and are NOT bit-identical, because the
+    logit/sigmoid round trip rounds twice where ``1 - t`` rounds once. Both
+    halves of that are asserted: a drift would mean the shared schedule and
+    the reference had genuinely diverged, and exact equality would mean the
+    parity argument for keeping the straight form was never needed.
+    """
+    t = torch.linspace(0.01, 0.99, 64)
+    shared, straight = rectified_flow_path(t), linear_path(t)
+    assert torch.allclose(shared.alpha, straight.alpha, atol=1e-6)
+    assert torch.allclose(shared.sigma, straight.sigma, atol=1e-6)
+    assert not torch.equal(shared.sigma, straight.sigma)
+
+
+def test_both_paths_share_the_velocity_target() -> None:
+    """The target is ``eps - x`` either way, which is what lets the sampler
+    hand this model's output to ``target_rectified_flow`` unchanged."""
+    t = torch.linspace(0.01, 0.99, 8)
+    assert rectified_flow_path(t).d_alpha == linear_path(t).d_alpha
+    assert rectified_flow_path(t).d_sigma == linear_path(t).d_sigma
 
 
 def test_cosine_path_stays_on_the_unit_circle() -> None:
@@ -268,12 +293,7 @@ def test_the_time_transform_slot_can_be_rebound() -> None:
 
 @pytest.mark.parametrize("term", ["denoising", "cls"])
 def test_per_sample_terms_keep_the_batch_axis(term: str) -> None:
-    """Per-sample errors stay per-sample so a metric can weight them.
-
-    Args:
-      term: Name of the term under test.
-
-    """
+    """Per-sample errors stay per-sample so a metric can weight them."""
     model = tiny_model()
     result = SpeedrunDiTLoss.Config().make()(model, **inputs())
     assert getattr(result, term).shape == (BATCH,)

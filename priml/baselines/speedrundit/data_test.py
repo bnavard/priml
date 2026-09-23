@@ -278,13 +278,7 @@ def test_mismatched_trees_are_refused(tmp_path: Path) -> None:
     [("batch_size", 0), ("eval_batch_size", -1), ("num_samples", 0)],
 )
 def test_nonpositive_sizes_are_refused(field: str, value: int) -> None:
-    """A zero batch is a configuration error, not an empty pass.
-
-    Args:
-      field: Config field to corrupt.
-      value: The offending value.
-
-    """
+    """A zero batch is a configuration error, not an empty pass."""
     config = SpeedrunDiTData.Config()
     setattr(config, field, value)
     with pytest.raises(ValueError, match=field):

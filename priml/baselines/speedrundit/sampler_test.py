@@ -7,9 +7,9 @@ from typing import Final
 import pytest
 import torch
 
-from priml.baselines.speedrundit.loss import cosine_path
 from priml.baselines.speedrundit.model import SpeedrunDiT
 from priml.baselines.speedrundit.sampler import EulerMaruyamaSampler
+from priml.math.diffusion import target_rectified_flow, target_v
 
 
 pytestmark = pytest.mark.compute_training
@@ -73,17 +73,26 @@ def sampler(**overrides: object) -> EulerMaruyamaSampler:
     return config.make()
 
 
-def test_the_grid_descends_from_one_to_zero() -> None:
-    """Integration runs backwards in time and lands exactly on zero.
+def test_log_snr_rises_as_time_descends() -> None:
+    """Denoising means increasing signal-to-noise, monotonically.
 
-    Stopping short of zero would leave the sample still noisy; overshooting
-    would divide by a vanished sigma.
+    ``ddpm_ddim_step`` computes ``log1mexp(log_snr_curr - log_snr_next)``,
+    which is NaN unless the grid increases; a reversed grid fails here rather
+    than producing silent NaNs a hundred steps in.
     """
-    grid = sampler().times((CHANNELS, GRID, GRID), torch.device("cpu"))
-    assert grid.shape == (5,)
-    assert grid[0].item() == pytest.approx(1.0)
-    assert grid[-1].item() == 0.0
-    assert torch.all(grid[:-1] >= grid[1:])
+    grid = sampler().log_snr((CHANNELS, GRID, GRID), torch.device("cpu"))
+    assert grid.shape == (4,)
+    assert torch.all(grid[1:] > grid[:-1])
+    assert torch.all(torch.isfinite(grid))
+
+
+def test_the_grid_stops_short_of_zero() -> None:
+    """``log_snr`` at ``t = 0`` is infinite, so the grid must not reach it."""
+    grid = sampler(last_time=0.04).log_snr(
+        (CHANNELS, GRID, GRID),
+        torch.device("cpu"),
+    )
+    assert torch.all(torch.isfinite(grid))
 
 
 def test_the_time_shift_moves_the_grid() -> None:
@@ -93,8 +102,8 @@ def test_the_time_shift_moves_the_grid() -> None:
     model was never fit to.
     """
     shape = (32, 16, 16)
-    shifted = sampler().times(shape, torch.device("cpu"))
-    plain = sampler(time_shift_base=None).times(shape, torch.device("cpu"))
+    shifted = sampler().log_snr(shape, torch.device("cpu"))
+    plain = sampler(time_shift_base=None).log_snr(shape, torch.device("cpu"))
     assert not torch.equal(shifted, plain)
 
 
@@ -157,9 +166,28 @@ def test_guidance_runs_a_second_pass() -> None:
     assert not torch.equal(plain.media, guided.media)
 
 
-def test_the_path_is_injected() -> None:
-    """The sampler integrates whatever path it is handed."""
-    assert sampler(interpolant=cosine_path).config.interpolant is cosine_path
+def test_the_decomposition_defaults_to_the_shared_rectified_flow() -> None:
+    """The model predicts a velocity, which is what this function reads.
+
+    Pinned because the objective and the sampler have to agree on what the
+    output MEANS: a sampler decomposing a velocity as if it were an epsilon
+    prediction produces plausible noise and no error.
+    """
+    assert sampler().config.target_fn is target_rectified_flow
+
+
+def test_the_decomposition_is_injected() -> None:
+    """A model trained to predict something else swaps this, not the loop."""
+    assert sampler(target_fn=target_v).config.target_fn is target_v
+
+
+def test_eta_selects_between_ddim_and_ddpm() -> None:
+    """Zero is deterministic, so two runs agree without seeding."""
+    model = tiny_model()
+    media, label, cls_token = noise()
+    first = sampler(eta=0.0)(model, media, label, cls_token)
+    second = sampler(eta=0.0)(model, media, label, cls_token)
+    assert torch.equal(first.media, second.media)
 
 
 if __name__ == "__main__":

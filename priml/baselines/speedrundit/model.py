@@ -5,23 +5,16 @@ upstream recipe measures as load-bearing, each of which is a slot here rather
 than a flag: 2D rotary positions, SPRINT sparse-dense residual fusion, value
 residual learning, and a diffused class token carried alongside the patches.
 
-The construction order below is a CONTRACT, not a style. ``initialize_weights``
-re-draws every ``nn.Linear`` with ``xavier_uniform_`` after the whole tree
-exists, so the weights a run starts from depend on how many random numbers each
-constructor consumed before it. Reordering two submodules, or swapping one for
-a Priml wrapper whose ``reset_parameters`` draws a different count, shifts every
-subsequent draw and silently changes the initialization. That is why the leaves
-on the RNG path are torch's own (``nn.Linear``, ``nn.Conv2d``, ``nn.Embedding``)
-and why ``priml.model.Linear`` -- whose ``init_bias`` defaults to ``zeros_`` and
-therefore draws nothing where torch draws ``bias.numel()`` -- is deliberately
-not used. ``priml.model.norm.RMSNorm`` IS used: with ``elementwise_affine=False``
-it registers no parameter and its forward is the same ``functional.rms_norm``
-call torch's own module makes, so it is free and bit-identical.
-
-Reference:
-  https://github.com/SwayStar123/SpeedrunDiT at c24c2ff25699cce63174ca56c2afcfeeb225e367
+Construction order is a contract here, not a style. ``reset_parameters``
+re-draws every linear layer after the whole tree exists, so what a run starts
+from depends on how many random numbers each constructor consumed before it:
+reordering two submodules shifts every later draw. That is also why the leaves
+on this path are torch's own rather than their Priml wrappers, which draw
+different counts.
 
 References:
+  https://github.com/SwayStar123/SpeedrunDiT
+    The reference, pinned at c24c2ff25699cce63174ca56c2afcfeeb225e367.
   https://arxiv.org/abs/2512.12386
     Bhanded 2025, "Speedrunning ImageNet Diffusion."
   https://arxiv.org/abs/2401.08740
@@ -486,13 +479,8 @@ class LabelEmbedder(nn.Module):
 class AdaLNModulation(nn.Module):
     """Project conditioning to adaLN shift, scale and gate triples.
 
-    ``priml.model.AdaLNZero`` computes the same projection and is deliberately
-    not reused, for two measured reasons. Its ``Output`` orders the six chunks
-    ``(scale, shift, gate)`` where this projection's rows are
-    ``(shift, scale, gate)``, so the same weight tensor means different things
-    in the two; and its ``proj`` slot defaults to ``init_weight=zeros_``, which
-    draws nothing where the reference's ``nn.Linear`` draws ``6HxH + 6H``,
-    shifting every later initialization draw. Either alone would break parity.
+    Zero-initialized, which is what makes each gated sublayer an identity at
+    step zero rather than a random perturbation.
     """
 
     class Config(Fig["AdaLNModulation"], kw_only=False):
@@ -551,6 +539,10 @@ class AdaLNModulation(nn.Module):
         activation = (
             nn.SiLU() if config.activation is None else config.activation.make()
         )
+        # Not ``priml.model.AdaLNZero``, which computes this exact projection:
+        # its chunks are ordered (scale, shift, gate) where these rows are
+        # (shift, scale, gate), so one weight tensor means different things in
+        # the two. Its zero-init also draws nothing where this draws 6H*H + 6H.
         self.modulation = nn.Sequential(
             activation,
             nn.Linear(config.cond_dim, config.num_groups * config.channels_in, True),
@@ -1642,13 +1634,6 @@ class SpeedrunDiT(nn.Module):
         heads: int = 12
         """Attention heads per block."""
 
-        channels_decoder: int = -1
-        """Width of the readout; ``-1`` follows ``channels_hidden``.
-
-        The reference exposes this separately while every published size sets
-        it equal to the trunk width, so the two disagreeing is a configuration
-        error rather than a supported mode; ``finalize`` refuses it."""
-
         num_classes: int = 1000
         """Real classes; the null class for guidance is appended beyond them."""
 
@@ -1752,15 +1737,6 @@ class SpeedrunDiT(nn.Module):
 
         @override
         def finalize(self) -> Self:
-            if self.channels_decoder == -1:
-                self.channels_decoder = self.channels_hidden
-            if self.channels_decoder != self.channels_hidden:
-                raise ValueError(
-                    "channels_decoder must equal channels_hidden; the trunk "
-                    "hands the readout its own width and no projection sits "
-                    f"between them. Got {self.channels_decoder} and "
-                    f"{self.channels_hidden}.",
-                )
             if not self.projector_dims:
                 raise ValueError("projector_dims must name at least one target.")
             if self.channels_hidden % self.heads:
@@ -1796,7 +1772,10 @@ class SpeedrunDiT(nn.Module):
             self.block.attn.heads = self.heads
             self.block.attn.norm_qk = self.norm_qk
 
-            self.readout.channels_in = self.channels_decoder
+            # The trunk hands the readout its own width: the reference exposes
+            # a separate decoder width, but no projection sits between them and
+            # every published size leaves the two equal.
+            self.readout.channels_in = self.channels_hidden
             self.readout.channels_out = self.patch_size**2 * self.channels_out
             self.readout.cond_dim = self.channels_hidden
             self.readout.channels_cls = self.channels_cls
@@ -1928,10 +1907,12 @@ class SpeedrunDiT(nn.Module):
         self.grid = config.image_size // config.patch_size
         self.projector_dims = list(config.projector_dims)
 
-        # Construction order is the initialization contract; see the module
-        # docstring. Every submodule below draws from the global generator, and
-        # ``reset_parameters`` re-draws them all afterwards from whatever state
-        # this sequence leaves behind.
+        # Construction order fixes the global-RNG draw order, so a seeded init
+        # is reproducible: routing -> patches -> time -> labels -> blocks ->
+        # projectors -> readout. ``priml.model.Linear`` cannot substitute for
+        # ``nn.Linear`` anywhere below -- its ``init_bias`` is ``zeros_``,
+        # which draws nothing where torch draws ``bias.numel()``, shifting
+        # every later draw. ``RMSNorm`` can: unaffine it holds no parameter.
         self.sprint = None if config.sprint is None else config.sprint.make()
         self.x_embedder = config.patch_embedder.make()
         self.t_embedder = config.time_embedder.make()
@@ -2163,16 +2144,7 @@ class SpeedrunDiT(nn.Module):
 
     @staticmethod
     def _gather_values(values: Tensor | None, keep: Tensor) -> Tensor | None:
-        """Select first-layer values for a kept token subset.
-
-        Args:
-          values: First layer's values, ``[batch, heads, tokens, channels]``.
-          keep: Kept indices, ``[batch, kept]``.
-
-        Returns:
-          values: ``[batch, heads, kept, channels]``, or ``None``.
-
-        """
+        """Select first-layer values for a kept token subset."""
         if values is None:
             return None
         index = keep[:, None, :, None].expand(-1, values.size(1), -1, values.size(-1))

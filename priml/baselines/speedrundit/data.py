@@ -299,6 +299,9 @@ class SpeedrunDiTData:
           order: A permutation of ``[0, count)``.
 
         """
+        # A named stream, not the global one: the order has to be rebuildable
+        # from (seed, pass) alone, because resume replays the pass it was
+        # interrupted in rather than restoring a saved permutation.
         generator = torch.Generator()
         generator.manual_seed(salt("speedrundit_shuffle", self.config.seed, pass_index))
         order = torch.randperm(count, generator=generator)
@@ -332,6 +335,8 @@ class SpeedrunDiTData:
                 continue
             if index < skip:
                 continue
+            # Recorded BEFORE the yield: a checkpoint taken mid-pass saves the
+            # index of the batch the consumer has not seen yet.
             self._next_batch = index + 1
             yield corpus.batch(rows, width=size, valid=valid)
 
@@ -385,16 +390,7 @@ class _Corpus:
 
 
 def _pad(x: Tensor, pad: int) -> Tensor:
-    """Extend a batch to a constant width with zero rows.
-
-    Args:
-      x: A batch-major tensor.
-      pad: Rows to append.
-
-    Returns:
-      padded: ``x`` when ``pad`` is zero, else ``x`` with zero rows appended.
-
-    """
+    """Extend a batch to a constant width with zero rows."""
     if pad <= 0:
         return x
     filler = x.new_zeros((pad, *x.shape[1:]))
@@ -472,6 +468,8 @@ def _load_corpus(
 
     payload = DictCodec.coerce(loads(manifest.read_text(encoding="utf-8")))
     entries = ListCodec.coerce(payload["labels"], list)
+    # Keys are normalized to forward slashes: a corpus prepared on Windows
+    # writes backslashes into the manifest but is read on either platform.
     table = {str(entry[0]).replace("\\", "/"): int(entry[1]) for entry in entries}
     labels = [table[name] for name in latent_names]
 
@@ -486,6 +484,8 @@ def _load_corpus(
             f"latents must be rank {LATENT_RANK} per sample; "
             f"got {tuple(stacked.shape)}.",
         )
+    # Scaled once, here, so the model and the sampler both see the same
+    # space; decoding inverts it by dividing.
     media = stacked.to(device=device, dtype=dtype) * latent_scale
 
     images = None
@@ -507,15 +507,7 @@ def _load_corpus(
 
 
 def _read_image(path: Path) -> NDArray[np.uint8]:
-    """Decode one stored image to channel-major uint8.
-
-    Args:
-      path: Image or ``.npy`` file.
-
-    Returns:
-      image: ``[channels, height, width]`` uint8.
-
-    """
+    """Decode one stored image to ``[channels, height, width]`` uint8."""
     if path.suffix.lower() == ".npy":
         array = np.load(path)
         return array.reshape(-1, *array.shape[-2:])
@@ -532,18 +524,7 @@ def _optional(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tensor:
-    """Read an optional per-sample array, or zeros when absent.
-
-    Args:
-      path: Candidate ``.npy`` file.
-      count: Samples the corpus holds.
-      device: Where the tensor lands.
-      dtype: Tensor dtype.
-
-    Returns:
-      tensor: The stored array, or a zero column.
-
-    """
+    """Read an optional per-sample array, or a zero column when absent."""
     if not path.is_file():
         return torch.zeros((count, 1), device=device, dtype=dtype)
     return torch.from_numpy(np.load(path)[:count]).to(device=device, dtype=dtype)
@@ -555,18 +536,7 @@ def _optional_list(
     device: torch.device,
     dtype: torch.dtype,
 ) -> list[Tensor]:
-    """Read optional alignment features.
-
-    Args:
-      path: Candidate ``.npy`` file.
-      count: Samples the corpus holds.
-      device: Where the tensor lands.
-      dtype: Tensor dtype.
-
-    Returns:
-      features: A one-element list, or empty when absent.
-
-    """
+    """Read optional alignment features; empty when the corpus has none."""
     if not path.is_file():
         return []
     return [torch.from_numpy(np.load(path)[:count]).to(device=device, dtype=dtype)]

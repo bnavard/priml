@@ -128,11 +128,16 @@ class SpeedrunDiTTrainStep(TrainStep):
         with self._autocast():
             result = self._evaluate(batch)
         result.loss.backward()
+        # Clipped outside the timer bracket: the bracket is what advances
+        # ``global_step``, and the clip is not part of the update it counts.
         if self.config.gradient_clip_norm != float("inf"):
             _ = clip_grad_norm_(
                 self.model.parameters(),
                 self.config.gradient_clip_norm,
             )
+        # This bracket is what advances ``global_step``, so every cadence
+        # above -- eval, checkpoint, the schedule horizon -- counts one
+        # optimizer update per pass through it.
         with self.timer_step:
             self.apply_learning_rate()
             self.optimizer.step()
@@ -224,15 +229,7 @@ class SpeedrunDiTTrainStep(TrainStep):
 
 
 def _metrics(result: SpeedrunDiTLoss.Output) -> dict[str, float | Tensor]:
-    """Publish every term of the objective.
-
-    Args:
-      result: One objective evaluation.
-
-    Returns:
-      metrics: Scalar terms, keyed for the tracker.
-
-    """
+    """Publish every term of the objective, keyed for the tracker."""
     return {
         "denoising": result.denoising.detach().mean(),
         "cls": result.cls.detach().mean(),

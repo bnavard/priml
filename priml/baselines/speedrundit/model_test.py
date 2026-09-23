@@ -205,18 +205,10 @@ def test_eval_draws_no_randomness() -> None:
         ("image_size", 3, "divisible"),
         ("heads", 7, "divisible"),
         ("projector_dims", (), "at least one"),
-        ("channels_decoder", 128, "channels_decoder"),
     ],
 )
 def test_invalid_geometry_is_refused(field: str, value: object, match: str) -> None:
-    """A misshaped config fails at finalize, naming the field.
-
-    Args:
-      field: Config field to corrupt.
-      value: The offending value.
-      match: Substring the message must carry.
-
-    """
+    """A misshaped config fails at finalize, naming the field."""
     cfg = tiny()
     setattr(cfg, field, value)
     with pytest.raises(ValueError, match=match):

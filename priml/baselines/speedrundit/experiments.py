@@ -76,6 +76,9 @@ def exp000() -> SpeedrunDiTLoop:
       initialization, one forward, the objective, and five optimizer steps --
       not a score. A score only becomes meaningful once identity holds.
 
+    Returns:
+      cfg: Training loop for the reference recipe.
+
     References:
       https://github.com/SwayStar123/SpeedrunDiT
         Pinned at c24c2ff25699cce63174ca56c2afcfeeb225e367.
@@ -85,9 +88,6 @@ def exp000() -> SpeedrunDiTLoop:
         Yu et al. 2024, "Representation Alignment for Generation."
       https://arxiv.org/abs/2506.05350
         Stoica et al. 2025, "Contrastive Flow Matching."
-
-    Returns:
-      cfg: Training loop for the reference recipe.
 
     Results:
       TBD.
