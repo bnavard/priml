@@ -7,16 +7,17 @@ Measure this port against the pinned upstream SpeedrunDiT, bit for bit.
 
 Clones the reference at a pinned commit, imports it UNMODIFIED, and compares
 with exact tensor equality inside Priml's host-agnostic numeric context: the
-loader, initialization, five optimizer steps of exp000's own train step (times,
-noise, losses, every gradient, every weight, the EMA shadow), an eval forward
-with and without the sparse path, and the guided sampler.
+ImageNet conversion, the loader, initialization, five optimizer steps of
+exp000's own train step (times, noise, losses, every gradient, every weight,
+the EMA shadow), an eval forward with and without the sparse path, and the
+guided sampler.
 
 Nothing here is a unit test. It needs a network, a git clone, and a minute,
 and it establishes the port ONCE against a moving upstream; the bit-for-bit
 goldens under ``testdata/`` are what keep it frozen afterwards. So this module
 is never imported by the library, and the library never imports it. The
-reference imports ``timm``, which Priml does not depend on, so the run supplies
-it for its own duration.
+reference imports ``timm``, and its preprocessing ``click`` and ``tqdm``, none of
+which Priml depends on, so the run supplies them for its own duration.
 
 The comparison is deliberately one-substitution: both sides run the same
 geometry, the same seed, and the same input tensors, and neither is adjusted
@@ -25,8 +26,8 @@ numerical -- parameter names -- it is REPORTED under its own heading rather
 than normalized away.
 
 Examples:
-  uv --quiet run --frozen --with timm python -m priml.baselines.speedrundit.scripts.parity  # noqa: E501
-  uv --quiet run --frozen --with timm python -m priml.baselines.speedrundit.scripts.parity --upstream /path/to/SpeedrunDiT  # noqa: E501
+  uv --quiet run --frozen --with timm --with click --with tqdm python -m priml.baselines.speedrundit.scripts.parity  # noqa: E501
+  uv --quiet run --frozen --with timm --with click --with tqdm python -m priml.baselines.speedrundit.scripts.parity --upstream /path/to/SpeedrunDiT  # noqa: E501
 
 '''
 # fmt: on
@@ -48,6 +49,7 @@ import subprocess
 import sys
 import tempfile
 
+from PIL import Image
 from torch import Tensor, nn
 
 import numpy as np
@@ -58,6 +60,7 @@ from priml.baselines.speedrundit.experiments import exp000
 from priml.baselines.speedrundit.loss import SpeedrunDiTLoss
 from priml.baselines.speedrundit.model import SpeedrunDiT
 from priml.baselines.speedrundit.sampler import EulerMaruyamaSampler
+from priml.baselines.speedrundit.scripts.prepare_data import convert
 from priml.baselines.speedrundit.train_step import SpeedrunDiTTrainStep
 from priml.testing.bfb import host_agnostic_numerics
 from priml.train.parallelism import NoParallel
@@ -452,6 +455,124 @@ def synthetic_corpus(root: Path, *, count: int) -> None:
     # encodes them each step; the reference's loader never looks at this file.
     width = cast(list[int], GEOMETRY["z_dims"])[0]
     np.save(root / "cls_token.npy", rng.standard_normal((count, width), np.float32))
+
+
+IMAGENET_SPECS: Final = (
+    (500, 375, "RGB", "JPEG"),
+    (375, 500, "RGB", "JPEG"),
+    (1200, 900, "RGB", "JPEG"),
+    (2100, 2100, "RGB", "JPEG"),
+    (256, 256, "RGB", "JPEG"),
+    (200, 150, "RGB", "JPEG"),
+    (333, 257, "RGB", "JPEG"),
+    (640, 480, "L", "JPEG"),
+    (640, 427, "CMYK", "JPEG"),
+    (300, 400, "RGB", "PNG"),
+    (300, 300, "RGBA", "PNG"),
+    (220, 330, "P", "PNG"),
+    (220, 330, "LA", "PNG"),
+)
+"""Size, mode, and container of each synthetic ImageNet image.
+
+Landscape, portrait and square; no, one, and two box halvings, and an
+upscale; odd sizes for the bicubic rounding; and every mode the real archive
+or ``convert("RGB")`` distinguishes -- ImageNet's train split holds CMYK
+JPEGs and a PNG named ``.JPEG``, and every file is named ``.JPEG``."""
+
+
+def synthetic_imagenet(root: Path) -> None:
+    """Write an extracted ImageNet ``train/`` tree covering every conversion path.
+
+    Its synsets are the first of the canonical list, where indexing the
+    directories present -- the reference's rule -- and indexing the full
+    list -- priml's -- agree. File names are ImageNet's unpadded ones, so
+    string order and numeric order differ.
+
+    Args:
+      root: Destination; ``train/`` is created beneath it.
+
+    """
+    synsets = ("n01440764", "n01443537", "n01484850")
+    rng = np.random.default_rng(0)
+    for index, (width, height, mode, container) in enumerate(IMAGENET_SPECS):
+        synset = synsets[index % len(synsets)]
+        (root / "train" / synset).mkdir(parents=True, exist_ok=True)
+        rows = np.arange(height)[:, None].repeat(width, 1)
+        cols = np.arange(width)[None, :].repeat(height, 0)
+        ramp = np.stack([cols, rows, cols + rows], -1) % 192
+        pixels = rng.integers(0, 64, (height, width, 3)) + ramp
+        image = Image.fromarray(pixels.astype(np.uint8), "RGB")
+        if mode == "RGBA":
+            alpha = rng.integers(0, 256, (height, width, 1), dtype=np.uint8)
+            image = Image.fromarray(np.concatenate([np.asarray(image), alpha], -1))
+        elif mode == "P":
+            image = image.convert("P", palette=Image.Palette.ADAPTIVE, colors=64)
+        else:
+            image = image.convert(mode)
+        path = root / "train" / synset / f"{synset}_{7**index % 10_007}.JPEG"
+        if container == "JPEG":
+            image.save(path, format="JPEG", quality=90)
+        else:
+            image.save(
+                path,
+                format="PNG",
+                **({"transparency": 3} if mode == "P" else {}),
+            )
+
+
+def compare_imagenet_convert(upstream: Path) -> bool:
+    """Compare the ImageNet conversion with the reference's ``convert``.
+
+    Both run unmodified on one synthetic ImageNet tree; the reference's tool
+    runs in its own process, as its README invokes it. Compared are every
+    file name, ``dataset.json`` byte for byte, and every PNG byte for byte.
+
+    Args:
+      upstream: Reference checkout.
+
+    Returns:
+      ok: Whether the two trees are identical.
+
+    """
+    print("imagenet convert")
+    with tempfile.TemporaryDirectory(prefix="speedrundit-imagenet-") as name:
+        root = Path(name)
+        synthetic_imagenet(root / "imagenet")
+        subprocess.run(  # noqa: S603 -- The running interpreter and fixed arguments.
+            [
+                sys.executable,
+                "dataset_tools.py",
+                "convert",
+                f"--source={root / 'imagenet' / 'train'}",
+                f"--dest={root / 'reference' / 'images'}",
+                "--resolution=256x256",
+                "--transform=center-crop-dhariwal",
+                "--workers=2",
+            ],
+            cwd=upstream / "preprocessing",
+            check=True,
+            capture_output=True,
+        )
+        count = convert(root / "imagenet", root / "port", workers=2)
+        left, right = (
+            {
+                p.relative_to(r).as_posix(): p.read_bytes()
+                for p in sorted(r.rglob("*"))
+                if p.is_file()
+            }
+            for r in (root / "reference" / "images", root / "port" / "images")
+        )
+        ok = report(
+            "file names",
+            list(left) == list(right),
+            f"{len(left)} vs {len(right)}",
+        )
+        ok &= report(
+            "dataset.json",
+            left.get("dataset.json") == right.get("dataset.json"),
+        )
+        differ = [n for n in left if left[n] != right.get(n)]
+        return ok & report(f"{count} PNGs", not differ, f"first: {differ[:1]}")
 
 
 def draw_inputs(generator: torch.Generator, *, classes: int) -> dict[str, Tensor]:
@@ -933,6 +1054,7 @@ def main() -> int:
     with pinned_source(flags.upstream) as upstream:
         sys.path.insert(0, str(upstream))
         ok = compare_loader(upstream)
+        ok &= compare_imagenet_convert(upstream)
 
         print("initialization")
         testdata = Path(__file__).resolve().parents[1] / "testdata"

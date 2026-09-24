@@ -21,14 +21,64 @@ The synthetic corpus has to match the geometry of the experiment reading it:
 768-wide targets), so the flags above are `exp_smoke`'s, and
 `experiments_test.py` keeps them in step with its docstring.
 
-`exp000` expects a corpus prepared by the reference's own encoding pipeline:
-ImageNet-256 through INVAE (f16, 32 channels) for the latents, plus the frozen
-encoder's targets beside them. `cls_token.npy` is required -- the class token is
-an input the model diffuses -- and `features.npy` is optional, the alignment
-term being zero without it. The reference computes both with DINOv2 ViT-B/14
-from the images at every step; this port reads them precomputed and does not
-reimplement either encoder. `prepare_data --verify` checks a tree against the
-layout the loader reads, through the loader's own manifest parser.
+`exp000` trains on the reference's corpus, which is built from ImageNet in
+three stages. The first is this baseline's; the other two need encoders that
+Priml does not carry.
+
+```bash
+uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --convert --imagenet /datasets/imagenet
+# From the reference's clone, in its own environment: the INVAE encoder is not Priml's.
+python preprocessing/dataset_tools.py encode --source=<corpus>/images --dest=<corpus>/vae-in
+uv --quiet run --frozen python -m priml.baselines.speedrundit.scripts.prepare_data --verify
+```
+
+1. **Images.** `--convert` reads extracted ImageNet (`train/<synset>/*.JPEG`)
+   and writes the reference's `images/` tree: 256px ADM centre crops as
+   uncompressed PNGs, numbered by sorted position, with `images/dataset.json`.
+   `parity.py` checks it byte for byte against the reference's
+   `dataset_tools.py convert`.
+2. **Latents.** The reference's `dataset_tools.py encode`, run from its
+   clone, INVAE-encodes that tree into `vae-in/` (f16, 32 channels) and
+   carries the labels into `vae-in/dataset.json`.
+3. **Targets.** `cls_token.npy` is required -- the class token is an input the
+   model diffuses -- and `features.npy` optional, the alignment term being
+   zero without it. The reference computes both with DINOv2 ViT-B/14 from the
+   images at every step; this port reads them precomputed.
+
+`--verify` checks the finished tree against the layout the loader reads,
+through the loader's own manifest parser.
+
+### Relation to the ImageNet baseline
+
+Raw ImageNet is read the ImageNet baseline's way, through the same pieces:
+
+| Piece | From |
+|---|---|
+| Walking `train/<synset>/*.JPEG`, sorted | `priml.data.sources.extracted_imagenet.ExtractedImageNetSource` |
+| Synset to class index | `priml.data.processors.labels.ImagenetSynsetToIndex` |
+| Reading and decoding | `GetBytesFromFile`, `GetDimensionsFromBytes`, `CropDuringDecodeImage` |
+| The class count | `priml.baselines.imagenet.data.NUM_CLASSES` |
+| Where ImageNet lives by default | `priml.baselines.imagenet.scripts.prepare_data.default_directory` |
+
+`imagenet_image_pipeline()` in `data.py` composes them; the ADM centre crop
+(`center_crop_dhariwal`) is the one piece Priml did not have. Three choices in
+it are the reference's, and each is measured:
+
+- **Decoding with PIL, not turbojpeg.** The reference decodes with
+  `PIL.Image.open`, so the shared decoder runs on its PIL path.
+- **Decoding RGBA and keeping three channels.** The reference's
+  `convert("RGB")` drops alpha, where the shared decoder's RGB path
+  composites it onto white; the two differed on the one RGBA image of the
+  parity fixture until this change, which covers CMYK, grayscale, palette,
+  LA and PNG-in-`.JPEG` files as well.
+- **The canonical synset list, not the directories present.** The reference
+  indexes the synsets it finds, sorted; on full ImageNet the canonical list is
+  that same sorted list, so the labels agree. A partial tree gets canonical
+  indices here, so a class means the same thing in every subset.
+
+Training itself reads the prepared corpus, not ImageNet: the model consumes
+INVAE latents paired with labels by position, which no ImageNet pipeline
+produces, so the latent loader stays this baseline's own.
 
 ## Experiments
 
@@ -52,6 +102,7 @@ above, every comparison exact (`torch.equal`) inside
 
 | Checkpoint | How it is compared |
 |---|---|
+| ImageNet conversion | Both `convert`s over one synthetic ImageNet tree; every file name, `dataset.json`, and every PNG byte for byte |
 | Data loading | Both loaders over one synthetic tree in the reference's layout; order, labels, latents and images |
 | Initialization | Same seed; every parameter, buffer and the frozen table, plus the RNG state construction leaves behind |
 | Parameter order | The order of every parameter that receives a gradient, which is the order the clip reduces its norm in |
@@ -60,11 +111,11 @@ above, every comparison exact (`torch.equal`) inside
 | Sampling | Guided, on an interval, against the reference's FID sampler `euler_maruyama_sampler_path_drop` |
 
 ```bash
-uv --quiet run --frozen --with timm python -m priml.baselines.speedrundit.scripts.parity
+uv --quiet run --frozen --with timm --with click --with tqdm python -m priml.baselines.speedrundit.scripts.parity
 ```
 
-The reference imports `timm`, which Priml does not depend on, so the command
-supplies it for its own duration. The script needs a network and a git clone,
+The reference imports `timm`, and its preprocessing `click` and `tqdm`, none of
+which Priml depends on, so the command supplies them for its own duration. The script needs a network and a git clone,
 so it is not a unit test. It establishes the port once against a moving
 upstream; the goldens under `testdata/` freeze it afterwards and run on CPU in
 the ordinary suite. Its geometry is the goldens' geometry, so what they freeze
@@ -162,7 +213,7 @@ without touching the recipe. Two things are deliberately **not** shrunk:
 Regenerating goldens:
 
 ```bash
-uv --quiet run --frozen --with timm python -m priml.baselines.speedrundit.scripts.parity --mint
+uv --quiet run --frozen --with timm --with click --with tqdm python -m priml.baselines.speedrundit.scripts.parity --mint
 CONFIGGLE_REGENERATE_GOLDEN=1 uv --quiet run --frozen pytest priml/baselines/speedrundit/experiments_test.py
 BFB_REGENERATE=1 uv --quiet run --frozen pytest priml/baselines/speedrundit/bfb_test.py
 ```

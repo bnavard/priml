@@ -10,6 +10,8 @@ from pathlib import Path
 
 import json
 
+from PIL import Image
+
 import pytest
 
 from priml.baselines.speedrundit.data import SpeedrunDiTData, read_labels
@@ -184,6 +186,79 @@ def test_verify_catches_an_unlabelled_latent(tmp_path: Path) -> None:
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ValueError, match="no label"):
         _ = prepare_data.verify(target)
+
+
+def write_imagenet(root: Path, *, broken: bool = False) -> None:
+    """Write a two-synset extracted ImageNet ``train/`` tree.
+
+    Args:
+      root: Destination; ``train/`` is created beneath it.
+      broken: Whether the second file of the first synset is undecodable.
+
+    """
+    for synset, shade in (("n01440764", 40), ("n01443537", 200)):
+        directory = root / "train" / synset
+        directory.mkdir(parents=True)
+        for name, size in (("10", (48, 32)), ("2", (32, 48))):
+            image = Image.new("RGB", size, (shade, 255 - shade, 7))
+            image.save(directory / f"{synset}_{name}.JPEG", format="JPEG")
+    if broken:
+        (root / "train" / "n01440764" / "n01440764_2.JPEG").write_bytes(b"not a jpeg")
+
+
+def test_convert_writes_the_reference_image_tree(tmp_path: Path) -> None:
+    """Sorted-walk numbering, canonical labels, and 256px RGB PNGs."""
+    write_imagenet(tmp_path / "imagenet")
+    count = prepare_data.convert(tmp_path / "imagenet", tmp_path / "corpus")
+    images = tmp_path / "corpus" / "images"
+    assert count == 4
+    payload = DictCodec.coerce(loads((images / "dataset.json").read_text("utf-8")))
+    # ``_10`` sorts before ``_2``: the numbering is the walk's string order.
+    assert payload["labels"] == [
+        ["00000/img00000000.png", 0],
+        ["00000/img00000001.png", 0],
+        ["00000/img00000002.png", 1],
+        ["00000/img00000003.png", 1],
+    ]
+    with Image.open(images / "00000" / "img00000000.png") as first:
+        assert (first.size, first.mode) == ((256, 256), "RGB")
+
+
+def test_convert_leaves_the_gap_of_an_undecodable_image(tmp_path: Path) -> None:
+    """The reference numbers by position in the walk, so a failure is a gap,
+    not a shift that would pair every later image with the wrong index.
+    """
+    write_imagenet(tmp_path / "imagenet", broken=True)
+    count = prepare_data.convert(tmp_path / "imagenet", tmp_path / "corpus")
+    images = tmp_path / "corpus" / "images" / "00000"
+    assert count == 3
+    assert sorted(p.name for p in images.iterdir()) == [
+        "img00000000.png",
+        "img00000002.png",
+        "img00000003.png",
+    ]
+
+
+def test_convert_refuses_a_directory_that_is_not_a_synset(tmp_path: Path) -> None:
+    """Labels come from the canonical list; an unknown class has none."""
+    write_imagenet(tmp_path / "imagenet")
+    cats = tmp_path / "imagenet" / "train" / "cats"
+    cats.mkdir()
+    Image.new("RGB", (8, 8)).save(cats / "cats_1.JPEG", format="JPEG")
+    with pytest.raises(ValueError, match="not synsets"):
+        _ = prepare_data.convert(tmp_path / "imagenet", tmp_path / "corpus")
+    assert not (tmp_path / "corpus" / "images").exists()
+
+
+def test_convert_leaves_an_occupied_tree_alone(tmp_path: Path) -> None:
+    """Refuse rather than mix two conversions in one tree."""
+    write_imagenet(tmp_path / "imagenet")
+    images = tmp_path / "corpus" / "images"
+    images.mkdir(parents=True)
+    (images / "keep.txt").write_text("hello", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        _ = prepare_data.convert(tmp_path / "imagenet", tmp_path / "corpus")
+    assert sorted(p.name for p in images.iterdir()) == ["keep.txt"]
 
 
 if __name__ == "__main__":

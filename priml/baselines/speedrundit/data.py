@@ -26,6 +26,11 @@ separators normalized to forward slashes. A loader that walks one tree and
 derives the other's names, or that reads ``images/dataset.json``, will look
 correct and pair the wrong label to the wrong latent.
 
+``images/`` is what ``imagenet_image_pipeline`` makes of extracted ImageNet,
+through priml's ImageNet source, synset labels and decoder plus the ADM crop;
+``prepare_data --convert`` writes it. ``vae-in/`` is the reference's INVAE
+encoding of those images.
+
 This module only READS. Staging lives in ``scripts/prepare_data.py``, so
 building a config touches neither the network nor the disk.
 """
@@ -37,11 +42,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, NotRequired, Self, TypedDict, cast, override
 
 from configgle import Fig
+from PIL import Image
 from torch import Tensor
 
 import numpy as np
 import torch
 
+from priml.data.pipeline.dataset import DataPipeline
+from priml.data.processors.bytes import (
+    CropDuringDecodeImage,
+    GetBytesFromFile,
+    GetDimensionsFromBytes,
+)
+from priml.data.processors.labels import ImagenetSynsetToIndex
+from priml.data.sources.extracted_imagenet import ExtractedImageNetSource
 from priml.lib.custom_json import DictCodec, IntCodec, ListCodec, StrCodec, loads
 from priml.math.seed import salt
 from priml.paths import resolve_working_dir
@@ -55,7 +69,15 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-__all__ = ["SpeedrunDiTBatch", "SpeedrunDiTData", "read_labels", "relative_names"]
+__all__ = [
+    "CenterCropDhariwal",
+    "SpeedrunDiTBatch",
+    "SpeedrunDiTData",
+    "center_crop_dhariwal",
+    "imagenet_image_pipeline",
+    "read_labels",
+    "relative_names",
+]
 
 
 LATENT_RANK: Final = 4
@@ -448,6 +470,126 @@ def relative_names(root: Path) -> list[str]:
     return sorted(found)
 
 
+def center_crop_dhariwal(image: NDArray[np.uint8], size: int) -> NDArray[np.uint8]:
+    """Crop and resize one image the way ADM prepares ImageNet.
+
+    Halve with a box filter while the short side stays at least twice
+    ``size``, resize bicubically so the short side is ``size``, then take the
+    centre square. Written as the reference writes it, PIL call for PIL call:
+    the reference's corpus is only reproducible from ImageNet through this
+    exact sequence of resamplings and roundings.
+
+    Args:
+      image: ``[height, width, 3]`` uint8 RGB.
+      size: Side of the square output.
+
+    Returns:
+      image: ``[size, size, 3]`` uint8 RGB.
+
+    References:
+      https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
+        ``center_crop_arr``, which the reference calls ``center-crop-dhariwal``.
+
+    """
+    pil_image = Image.fromarray(image)
+    while min(*pil_image.size) >= 2 * size:
+        half = (pil_image.size[0] // 2, pil_image.size[1] // 2)
+        pil_image = pil_image.resize(half, resample=Image.Resampling.BOX)
+    scale = size / min(*pil_image.size)
+    scaled = (round(pil_image.size[0] * scale), round(pil_image.size[1] * scale))
+    pil_image = pil_image.resize(scaled, resample=Image.Resampling.BICUBIC)
+    array = np.array(pil_image)
+    height, width = cast("tuple[int, ...]", array.shape)[:2]
+    top = (height - size) // 2
+    left = (width - size) // 2
+    return array[top : top + size, left : left + size]
+
+
+class CenterCropDhariwal:
+    """Apply :func:`center_crop_dhariwal` to a decoded image.
+
+    Example:
+      processor = CenterCropDhariwal.Config(size=256).make()
+
+    """
+
+    class Config(Fig["CenterCropDhariwal"]):
+        """Configuration for CenterCropDhariwal."""
+
+        size: int = 256
+        """Side of the square the image is cropped to."""
+
+    class Input(TypedDict, total=False):
+        """Input required by CenterCropDhariwal."""
+
+        media_tensor: Tensor
+        """``(C, 1, H, W)`` uint8, from ``CropDuringDecodeImage``; only the
+        first three channels are kept, so an alpha channel is dropped."""
+
+    Output = Input
+
+    def __init__(self, config: Config) -> None:
+        self.size = config.size
+
+    def __call__(self, samples: Iterator[Input]) -> Iterator[Output]:
+        """Crop each decoded image; pass through a sample with none.
+
+        Args:
+          samples: Decoded samples.
+
+        Yields:
+          sample: The same sample with ``media_tensor`` ``(3, 1, size, size)``.
+
+        """
+        for sample in samples:
+            media = sample.get("media_tensor")
+            if media is not None:
+                image = media[:3, 0].permute(1, 2, 0).numpy()
+                cropped = center_crop_dhariwal(image, self.size)
+                sample["media_tensor"] = (
+                    torch.from_numpy(np.ascontiguousarray(cropped))
+                    .permute(2, 0, 1)
+                    .unsqueeze(1)
+                )
+            yield sample
+
+
+def imagenet_image_pipeline() -> DataPipeline.Config:
+    """Return ImageNet's training images as the reference's corpus holds them.
+
+    ImageNet is read by priml's own extracted-ImageNet source in sorted order,
+    labelled by the canonical synset list, and decoded by the shared decoder
+    on its PIL path; only the ADM crop is this baseline's. PIL rather than
+    turbojpeg because the reference decodes with ``PIL.Image.open``, and the
+    two decoders need not round the same pixels alike.
+
+    Returns:
+      config: Pipeline yielding ``file_path``, ``label`` (int), and
+        ``media_tensor`` ``(3, 1, 256, 256)`` uint8 per image, unshuffled.
+
+    """
+    cfg = DataPipeline.Config()
+    source = ExtractedImageNetSource.Config()
+    source.split = "train"
+    cfg.source = source
+    decode = CropDuringDecodeImage.Config()
+    decode.use_turbojpeg = False
+    # RGBA, of which the crop keeps three channels: that is the reference's
+    # ``convert("RGB")``, which drops alpha, where the shared decoder's RGB
+    # path composites it onto white instead.
+    decode.channels_format = "rgba"
+    cfg.processors.extend(
+        [
+            ImagenetSynsetToIndex.Config(),
+            GetBytesFromFile.Config(),
+            GetDimensionsFromBytes.Config(),
+            decode,
+            CenterCropDhariwal.Config(),
+        ],
+    )
+    return cfg
+
+
 def _load_corpus(
     directory: Path,
     *,
@@ -549,9 +691,6 @@ def _read_image(path: Path) -> NDArray[np.uint8]:
         array = cast("NDArray[np.uint8]", np.load(path))
         shape = cast("tuple[int, ...]", array.shape)
         return array.reshape(-1, *shape[-2:])
-    # Deferred: a run using precomputed features never loads Pillow.
-    from PIL import Image  # noqa: PLC0415
-
     with Image.open(path) as handle:
         array = np.asarray(handle.convert("RGB"))
     return array.transpose(2, 0, 1)

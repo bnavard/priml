@@ -24,6 +24,7 @@ from typing import Final
 
 from configgle import Makes
 
+from priml.baselines.imagenet.data import NUM_CLASSES
 from priml.baselines.speedrundit.data import SpeedrunDiTData
 from priml.baselines.speedrundit.metric import VelocityError
 from priml.baselines.speedrundit.train_step import SpeedrunDiTTrainStep
@@ -39,9 +40,6 @@ LATENT_SIZE: Final = 16
 
 LATENT_CHANNELS: Final = 32
 """Channels an INVAE latent carries."""
-
-NUM_CLASSES: Final = 1000
-"""ImageNet-1k classes."""
 
 ENCODER_WIDTH: Final = 768
 """Feature width of DINOv2 ViT-B/14, the alignment target."""

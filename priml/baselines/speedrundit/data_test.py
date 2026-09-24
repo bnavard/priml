@@ -11,11 +11,20 @@ from typing import TYPE_CHECKING, Final
 
 import json
 
+from PIL import Image
+
 import numpy as np
 import pytest
 import torch
 
-from priml.baselines.speedrundit.data import SpeedrunDiTData, relative_names
+from priml.baselines.speedrundit.data import (
+    CenterCropDhariwal,
+    SpeedrunDiTData,
+    center_crop_dhariwal,
+    imagenet_image_pipeline,
+    relative_names,
+)
+from priml.data.sources.extracted_imagenet import ExtractedImageNetSource
 
 
 if TYPE_CHECKING:
@@ -359,6 +368,49 @@ def test_length_matches_what_the_loader_yields(tmp_path: Path) -> None:
     write_corpus(tmp_path, count=7)
     data = make(tmp_path, batch_size=2)
     assert len(data) == len(list(data.train_dataloader()))
+
+
+def test_center_crop_is_a_plain_crop_at_the_target_short_side() -> None:
+    """Already at the short side, the resize is the identity, leaving a centre
+    crop whose offset floors: ``(300 - 256) // 2`` columns from the left.
+    """
+    image = np.random.default_rng(0).integers(0, 256, (256, 300, 3), dtype=np.uint8)
+    cropped = center_crop_dhariwal(image, 256)
+    assert cropped.shape == (256, 256, 3)
+    assert np.array_equal(cropped, image[:, 22:278])
+
+
+def test_center_crop_halves_before_it_resamples() -> None:
+    """A short side at twice the target is box-halved, not resampled bicubically.
+
+    The oracle is the reference's own call, ``resize(..., BOX)``: PIL's exact
+    ``reduce(2)`` rounds differently, and the corpus is only reproducible
+    through the reference's spelling.
+    """
+    image = np.random.default_rng(1).integers(0, 256, (64, 96, 3), dtype=np.uint8)
+    source = Image.fromarray(image)
+    halved = np.asarray(source.resize((48, 32), resample=Image.Resampling.BOX))
+    bicubic = np.asarray(source.resize((48, 32), resample=Image.Resampling.BICUBIC))
+    cropped = center_crop_dhariwal(image, 32)
+    assert np.array_equal(cropped, halved[:, 8:40])
+    assert not np.array_equal(cropped, bicubic[:, 8:40])
+
+
+def test_the_crop_keeps_three_channels() -> None:
+    """Dropping alpha is the reference's ``convert("RGB")``."""
+    rgba = torch.randint(0, 256, (4, 1, 40, 30), dtype=torch.uint8)
+    processor = CenterCropDhariwal.Config(size=16).make()
+    sample: CenterCropDhariwal.Input = {"media_tensor": rgba}
+    (cropped,) = processor(iter([sample]))
+    assert "media_tensor" in cropped
+    assert cropped["media_tensor"].shape == (3, 1, 16, 16)
+
+
+def test_the_imagenet_pipeline_builds_without_imagenet() -> None:
+    """A config must build on a machine that has not staged the archive."""
+    config = imagenet_image_pipeline().copy_tree().finalize()
+    assert isinstance(config.source, ExtractedImageNetSource.Config)
+    assert not config.source.shuffle
 
 
 if __name__ == "__main__":
