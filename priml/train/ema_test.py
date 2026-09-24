@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 
 from priml.testing.fixtures import get_device
-from priml.train.ema import EMA, NoEMA, karras_decay
+from priml.train.ema import EMA, NoEMA, all_params, karras_decay
 
 
 if TYPE_CHECKING:
@@ -215,12 +215,7 @@ def test_ema_param_filter_excludes_matching_params() -> None:
         nn.Linear(2, 2),  # Named "1"
     )
 
-    def exclude_layer_1(name: str, p: nn.Parameter) -> bool:
-        del p
-        return not name.startswith("1.")
-
-    ema = EMA.Config(decay=0.0).make()
-    ema.set_param_filter(exclude_layer_1)
+    ema = EMA.Config(decay=0.0, param_filter=_exclude_layer_1).make()
     ema(model)
     # Mutate the excluded layer's weights; EMA should not track.
     layer_1_live = model[1]
@@ -235,7 +230,7 @@ def test_ema_param_filter_excludes_matching_params() -> None:
     assert diff > 0.0, "param_filter did not exclude layer 1"
 
 
-# -- seed / track_frozen ------------------------------------------------------
+# -- seed / all_params --------------------------------------------------------
 
 
 def test_ema_seed_starts_the_shadow_at_the_initial_weights() -> None:
@@ -264,13 +259,13 @@ def test_ema_seed_twice_raises() -> None:
         ema.seed(model)
 
 
-def test_ema_track_frozen_averages_frozen_parameters() -> None:
-    """A frozen parameter is averaged, and so drifts by rounding, when tracked."""
+def test_ema_all_params_averages_frozen_parameters() -> None:
+    """``all_params`` averages a frozen parameter; the default skips it."""
     model = nn.Linear(1, 1, bias=False)
     with torch.no_grad():
         model.weight.fill_(1.0)
     model.weight.requires_grad_(False)
-    tracked = EMA.Config(decay=0.5, track_frozen=True).make()
+    tracked = EMA.Config(decay=0.5, param_filter=all_params).make()
     skipped = EMA.Config(decay=0.5).make()
     for ema in (tracked, skipped):
         ema.seed(model)
@@ -917,6 +912,12 @@ def test_ema_rejects_negative_update_after_step() -> None:
     """#343: update_after_step is a warmup length and must be non-negative."""
     with pytest.raises(ValueError, match="update_after_step"):
         EMA.Config(update_after_step=-1).make()
+
+
+def _exclude_layer_1(name: str, param: nn.Parameter) -> bool:
+    """Track everything but the second layer."""
+    del param
+    return not name.startswith("1.")
 
 
 if __name__ == "__main__":

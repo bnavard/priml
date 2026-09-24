@@ -150,7 +150,7 @@ SpeedrunDiTLoop(
                 │               shadow_kind='module',
                 │               warmup_seed=False,
                 │               decay_schedule=<function priml.train.ema.constant_decay at 0xdefacedeface>,
-                │               track_frozen=True
+                │               param_filter=<function priml.train.ema.all_params at 0xdefacedeface>
                 │       ),
                 │       gradient_clip_norm=1.0,
                 │       skip_step_on_nonfinite_grad=False,

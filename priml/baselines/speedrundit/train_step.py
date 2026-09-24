@@ -24,7 +24,7 @@ import torch
 from priml.baselines.speedrundit.loss import SpeedrunDiTLoss
 from priml.baselines.speedrundit.model import SpeedrunDiT
 from priml.train.custom_types import EMAProtocol
-from priml.train.ema import EMA
+from priml.train.ema import EMA, all_params
 from priml.train.grad_clip import clip_grad_norm_
 from priml.train.train_step import TrainStep
 
@@ -76,15 +76,17 @@ class SpeedrunDiTTrainStep(TrainStep):
                 update_after_step=0,
                 track_buffers=False,
                 shadow_kind="module",
-                track_frozen=True,
+                param_filter=all_params,
             ),
         )
         """Weight-averaging shadow, seeded at construction and updated after
         each optimizer step.
 
         Seeded from the initial weights, as the reference seeds its copy
-        (``train.py:225``), and averaging the frozen position table too, as the
-        reference's ``update_ema`` walks every ``named_parameter``."""
+        (``train.py:225``). It averages the frozen position table too, as the
+        reference's ``update_ema`` walks every ``named_parameter`` -- a drift
+        its own author flags as unintended (``train.py:70``) but which the
+        reference's scores were measured under."""
 
         dtype_autocast: torch.dtype | None = torch.bfloat16
         """Autocast dtype for the model forward; ``None`` runs in full precision.
