@@ -83,27 +83,25 @@ SOURCE_REVISION: Final = "c24c2ff25699cce63174ca56c2afcfeeb225e367"
 STEPS: Final = 5
 """Optimizer steps compared."""
 
-# The goldens' geometry too, so what is minted is what was compared. Every
-# axis differs from every other it could be confused with -- batch 3 against
-# 2 heads, 3 latent channels against a 4-wide grid -- so a transpose between
-# any two cannot pass; a head of 8 gives the rotary ladder two rungs per axis
-# rather than the lone theta**0 a head of 4 would; and five layers is the
-# shallowest trunk that keeps a sparse SPRINT stage.
+# The smallest the reference builds: one head of four (the axial rotary
+# ladder's floor), a 2x2 grid, and five layers, since the reference hard-codes
+# two dense layers either side of its sparse stage. ``source_init`` is minted
+# here; the other goldens shrink the port further.
 GEOMETRY: Final[dict[str, object]] = {
-    "input_size": 4,
+    "input_size": 2,
     "patch_size": 1,
-    "in_channels": 3,
-    "hidden_size": 16,
-    "decoder_hidden_size": 16,
+    "in_channels": 1,
+    "hidden_size": 4,
+    "decoder_hidden_size": 4,
     "depth": 5,
-    "num_heads": 2,
+    "num_heads": 1,
     "encoder_depth": 2,
-    "num_classes": 10,
+    "num_classes": 3,
     "class_dropout_prob": 0.1,
     "use_cfg": True,
-    "z_dims": [6],
-    "projector_dim": 8,
-    "cls_token_dim": 6,
+    "z_dims": [2],
+    "projector_dim": 2,
+    "cls_token_dim": 2,
 }
 
 BATCH: Final = 3

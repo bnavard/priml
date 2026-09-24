@@ -102,8 +102,9 @@ from priml.model.linear import Linear
 from priml.model.narrow_embedding import NarrowEmbedding
 from priml.model.norm import RMSNorm
 from priml.model.swiglu import SwiGLUReluSquared, shifted_relu_squared
-from priml.optimizers.composite import CompositeOptimizer, matching
+from priml.optimizers.composite import CompositeOptimizer
 from priml.optimizers.fused_adamw import FusedAdamW
+from priml.optimizers.parameter_filter import matching
 from priml.runtime import SingleProcess
 from priml.train.checkpointer import Checkpointer
 from priml.train.parallelism import NoParallel

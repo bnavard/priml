@@ -12,8 +12,9 @@ runs a split recipe unchanged and a single ``state_dict`` round-trips the whole
 stack.
 
 Routing lives here too. :class:`CompositeOptimizer.Config` pairs each member
-with a :class:`Selector` -- a predicate over ``(name, parameter)`` -- and hands
-each member only the parameters it claims. A parameter claimed twice is an
+with a :class:`~priml.optimizers.parameter_filter.ParameterFilter` -- a predicate
+over ``(name, parameter)`` -- and hands each member only the parameters it
+claims. A parameter claimed twice is an
 error rather than a silent double update, and one claimed by nobody is left
 frozen only if the recipe says so.
 """
@@ -23,10 +24,12 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import field
 from functools import partial
-from typing import TYPE_CHECKING, Protocol, TypedDict, cast, overload, override
+from typing import TYPE_CHECKING, TypedDict, cast, overload, override
 
 from configgle import Fig, Makeable
 from torch.optim import Optimizer
+
+from priml.optimizers.parameter_filter import ParameterFilter, everything
 
 
 if TYPE_CHECKING:
@@ -35,140 +38,6 @@ if TYPE_CHECKING:
     from torch import Tensor, nn
     from torch.nn import Parameter
     from torch.optim.optimizer import StateDict as OptimizerStateDict
-
-
-class Selector(Protocol):
-    """Decides whether one named parameter belongs to a member optimizer."""
-
-    def __call__(self, name: str, parameter: Parameter) -> bool:
-        """Apply to the input."""
-        ...
-
-
-def everything(name: str, parameter: Parameter) -> bool:
-    """Select every parameter; the single-group recipe.
-
-    Args:
-      name: Name.
-      parameter: Parameter.
-
-    Returns:
-      result: The bool.
-
-    """
-    del name, parameter
-    return True
-
-
-class excluding:  # noqa: N801 -- The lowercase name matches the public combinator syntax.
-    """Narrow a selector by dropping parameters whose name contains a fragment.
-
-    A comparable object rather than a closure: two identical selectors must be
-    equal, or a config carrying one could never equal its own parent, which
-    breaks both experiment diffing and serialization.
-
-    Args:
-      select: Selector to narrow.
-      fragments: Name fragments to reject, e.g. ``"head"``.
-
-    """
-
-    __slots__ = ("fragments", "select")
-
-    def __init__(self, select: Selector, *fragments: str) -> None:
-        self.select = select
-        self.fragments = fragments
-
-    def __call__(self, name: str, parameter: Parameter) -> bool:
-        """Whether ``select`` claims this parameter and its name is allowed."""
-        return self.select(name, parameter) and not any(
-            fragment in name for fragment in self.fragments
-        )
-
-    @override
-    def __eq__(self, other: object) -> bool:
-        return (
-            isinstance(other, excluding)
-            and self.select == other.select
-            and self.fragments == other.fragments
-        )
-
-    @override
-    def __hash__(self) -> int:
-        return hash((type(self), self.select, self.fragments))
-
-    @override
-    def __repr__(self) -> str:
-        names = ", ".join(repr(f) for f in self.fragments)
-        return f"excluding({_name(self.select)}, {names})"
-
-
-class matching:  # noqa: N801 -- The lowercase name matches the public combinator syntax.
-    """Select parameters whose name contains any of the given fragments.
-
-    The positive counterpart to :class:`excluding`, and what a recipe needs to
-    put ONE class of parameter on its own rate: a partition built only from
-    exclusions can carve a remainder but cannot name a part.
-
-    A comparable object rather than a closure, for the reason
-    :class:`excluding` documents.
-
-    Args:
-      fragments: Name fragments to accept, e.g. ``"embed"``.
-
-    """
-
-    __slots__ = ("fragments",)
-
-    def __init__(self, *fragments: str) -> None:
-        self.fragments = fragments
-
-    def __call__(self, name: str, parameter: Parameter) -> bool:
-        """Whether this parameter's name carries one of the fragments."""
-        del parameter
-        return any(fragment in name for fragment in self.fragments)
-
-    @override
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, matching) and self.fragments == other.fragments
-
-    @override
-    def __hash__(self) -> int:
-        return hash((type(self), self.fragments))
-
-    @override
-    def __repr__(self) -> str:
-        return f"matching({', '.join(repr(f) for f in self.fragments)})"
-
-
-class complement:  # noqa: N801 -- The lowercase name matches the public combinator syntax.
-    """Select exactly what ``select`` does not, so a pair partitions the model.
-
-    Args:
-      select: Selector to invert.
-
-    """
-
-    __slots__ = ("select",)
-
-    def __init__(self, select: Selector) -> None:
-        self.select = select
-
-    def __call__(self, name: str, parameter: Parameter) -> bool:
-        """Whether ``select`` does NOT claim this parameter."""
-        return not self.select(name, parameter)
-
-    @override
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, complement) and self.select == other.select
-
-    @override
-    def __hash__(self) -> int:
-        return hash((type(self), self.select))
-
-    @override
-    def __repr__(self) -> str:
-        return f"complement({_name(self.select)})"
 
 
 class _ChainedState(dict[object, object]):
@@ -222,17 +91,17 @@ def _reject_shared_parameters(optimizers: Sequence[Optimizer]) -> None:
 def _route(
     model: nn.Module,
     members: Sequence[Callable[..., Optimizer]],
-    selectors: Sequence[Selector],
+    filters: Sequence[ParameterFilter],
     *,
     require_total: bool,
     drop_empty: bool = False,
 ) -> list[Optimizer]:
-    """Build each member over the trainable parameters its selector claims."""
+    """Build each member over the trainable parameters its filter claims."""
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     claimed: dict[int, str] = {}
     groups: list[list[Parameter]] = []
     kept: list[Callable[..., Optimizer]] = []
-    for index, select in enumerate(selectors):
+    for index, select in enumerate(filters):
         group: list[Parameter] = []
         for name, parameter in named:
             if not select(name, parameter):
@@ -240,7 +109,7 @@ def _route(
             owner = claimed.get(id(parameter))
             if owner is not None:
                 raise ValueError(
-                    f"Parameter {name!r} is claimed by selector {owner} and "
+                    f"Parameter {name!r} is claimed by filter {owner} and "
                     f"{index}; it would be updated twice per step.",
                 )
             claimed[id(parameter)] = str(index)
@@ -248,7 +117,7 @@ def _route(
         if not group:
             if drop_empty:
                 continue
-            raise ValueError(f"Selector {index} claimed no parameters.")
+            raise ValueError(f"Filter {index} claimed no parameters.")
         groups.append(group)
         kept.append(members[index])
     members = kept
@@ -256,7 +125,7 @@ def _route(
         unclaimed = [n for n, p in named if id(p) not in claimed]
         if unclaimed:
             raise ValueError(
-                f"No selector claims {len(unclaimed)} trainable parameter(s), "
+                f"No filter claims {len(unclaimed)} trainable parameter(s), "
                 f"e.g. {unclaimed[0]!r}; they would never be updated.",
             )
     return [member(group) for member, group in zip(members, groups, strict=True)]
@@ -280,7 +149,7 @@ class CompositeOptimizer(Optimizer):
         """The members this composite drives, and what each one claims.
 
         ``make()`` returns a builder taking the MODEL, so each member receives
-        only the parameters its selector claims::
+        only the parameters its filter claims::
 
             config = CompositeOptimizer.Config()
             config.optimizers = [SignSGD.Config(), Muon.Config()]
@@ -293,17 +162,17 @@ class CompositeOptimizer(Optimizer):
         )
         """Member configs, e.g. ``[Muon.Config(), SignSGD.Config()]``."""
 
-        select: list[Selector] = field(default_factory=list[Selector])
-        """One selector per member. Empty gives every member every parameter,
+        select: list[ParameterFilter] = field(default_factory=list[ParameterFilter])
+        """One filter per member. Empty gives every member every parameter,
         which is correct only when the members select for themselves."""
 
         require_total: bool = True
         """Reject a recipe that leaves a trainable parameter unclaimed."""
 
         drop_empty: bool = False
-        """Drop a member whose selector claims nothing, instead of raising.
+        """Drop a member whose filter claims nothing, instead of raising.
 
-        Off by default because an empty selector is normally a misspelled name
+        Off by default because an empty filter is normally a misspelled name
         fragment, and silently training nothing with that member is the worst
         possible response. Turn it on for a recipe that names a class the model
         MAY not instantiate -- an ablation that switches a mechanism off still
@@ -318,7 +187,7 @@ class CompositeOptimizer(Optimizer):
 
             Raises:
               ValueError: If no member is configured, or ``select`` is given
-                but does not name exactly one selector per member.
+                but does not name exactly one filter per member.
 
             """
             final = (
@@ -330,11 +199,11 @@ class CompositeOptimizer(Optimizer):
                 raise ValueError("CompositeOptimizer.Config needs a member.")
             if final.select and len(final.select) != len(final.optimizers):
                 raise ValueError(
-                    f"select names {len(final.select)} selectors for "
+                    f"select names {len(final.select)} filters for "
                     f"{len(final.optimizers)} optimizers.",
                 )
             members = [member.make() for member in final.optimizers]
-            selectors = final.select or [everything] * len(members)
+            filters = final.select or [everything] * len(members)
             require_total = final.require_total
             drop_empty = final.drop_empty
 
@@ -343,7 +212,7 @@ class CompositeOptimizer(Optimizer):
                     _route(
                         model,
                         members,
-                        selectors,
+                        filters,
                         require_total=require_total,
                         drop_empty=drop_empty,
                     ),
@@ -474,9 +343,3 @@ class CompositeOptimizer(Optimizer):
     def __repr__(self) -> str:
         members = ", ".join(type(o).__name__ for o in self.optimizers)
         return f"{type(self).__name__}({members})"
-
-
-def _name(select: Selector) -> str:
-    """Return a stable name for a selector, never an address."""
-    qualname = getattr(select, "__qualname__", None)
-    return qualname if isinstance(qualname, str) else repr(select)

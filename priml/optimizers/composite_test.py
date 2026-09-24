@@ -10,16 +10,15 @@ from torch import Tensor, nn
 import pytest
 import torch
 
-from priml.optimizers.composite import (
-    CompositeOptimizer,
-    _ChainedState,
+from priml.optimizers.composite import CompositeOptimizer, _ChainedState
+from priml.optimizers.muon import Muon
+from priml.optimizers.newton import Newton
+from priml.optimizers.parameter_filter import (
     complement,
     everything,
     excluding,
     matching,
 )
-from priml.optimizers.muon import Muon
-from priml.optimizers.newton import Newton
 
 
 def split_model() -> nn.Module:
@@ -233,7 +232,7 @@ def test_config_rejects_no_members() -> None:
         _ = CompositeOptimizer.Config().make()
 
 
-def test_config_routes_each_member_to_its_own_selector() -> None:
+def test_config_routes_each_member_to_its_own_filter() -> None:
     """The whole point: one recipe, disjoint groups, one optimizer out."""
     model = split_model()
     on_muon = excluding(Muon.eligible_tensor, "head")
@@ -250,11 +249,11 @@ def test_config_routes_each_member_to_its_own_selector() -> None:
     assert sorted(owned) == sorted(id(p) for p in model.parameters())
 
 
-def test_config_rejects_a_selector_count_mismatch() -> None:
+def test_config_rejects_a_filter_count_mismatch() -> None:
     config = CompositeOptimizer.Config()
     config.optimizers = [Muon.Config()]
     config.select = [everything, everything]
-    with pytest.raises(ValueError, match="select names 2 selectors"):
+    with pytest.raises(ValueError, match="select names 2 filters"):
         _ = config.make()
 
 
@@ -263,27 +262,27 @@ def test_config_rejects_an_unclaimed_parameter() -> None:
     config = CompositeOptimizer.Config()
     config.optimizers = [Muon.Config()]
     config.select = [Muon.eligible_tensor]
-    with pytest.raises(ValueError, match="No selector claims"):
+    with pytest.raises(ValueError, match="No filter claims"):
         _ = config.make()(split_model())
 
 
-def test_config_rejects_two_selectors_claiming_one_parameter() -> None:
+def test_config_rejects_two_filters_claiming_one_parameter() -> None:
     config = CompositeOptimizer.Config()
     config.optimizers = [Muon.Config(), Muon.Config()]
     config.select = [everything, everything]
-    with pytest.raises(ValueError, match="claimed by selector"):
+    with pytest.raises(ValueError, match="claimed by filter"):
         _ = config.make()(split_model())
 
 
-def test_config_rejects_a_selector_that_claims_nothing() -> None:
+def test_config_rejects_a_filter_that_claims_nothing() -> None:
     config = CompositeOptimizer.Config()
     config.optimizers = [PartialConfig(torch.optim.SGD, lr=0.1), Muon.Config()]
     config.select = [complement(matching("ghost")), matching("ghost")]
-    with pytest.raises(ValueError, match="Selector 1 claimed no parameters"):
+    with pytest.raises(ValueError, match="Filter 1 claimed no parameters"):
         _ = config.make()(split_model())
 
 
-def test_drop_empty_removes_a_member_whose_selector_claims_nothing() -> None:
+def test_drop_empty_removes_a_member_whose_filter_claims_nothing() -> None:
     """An ablation naming a mechanism the model lacks keeps its siblings' rates."""
     config = CompositeOptimizer.Config()
     config.optimizers = [PartialConfig(torch.optim.SGD, lr=0.1), Muon.Config()]
@@ -293,7 +292,7 @@ def test_drop_empty_removes_a_member_whose_selector_claims_nothing() -> None:
     assert [type(o).__name__ for o in optimizer.optimizers] == ["SGD"]
 
 
-def test_a_selector_receives_the_parameter_name() -> None:
+def test_a_filter_receives_the_parameter_name() -> None:
     model = split_model()
     seen: list[str] = []
 
@@ -308,54 +307,6 @@ def test_a_selector_receives_the_parameter_name() -> None:
     config.select = [_Recording()]
     _ = config.make()(model)
     assert seen == [name for name, _ in model.named_parameters()]
-
-
-def _weight() -> nn.Parameter:
-    return nn.Parameter(torch.zeros(2, 2))
-
-
-def test_matching_selects_by_name_fragment() -> None:
-    select = matching("embed", "head")
-    assert select("token_embed.weight", _weight())
-    assert select("lm_head.weight", _weight())
-    assert not select("block.0.attn.weight", _weight())
-
-
-def test_excluding_rejects_a_named_fragment_and_defers_otherwise() -> None:
-    select = excluding(Muon.eligible_tensor, "head")
-    assert select("block.weight", _weight())
-    assert not select("lm_head.weight", _weight())
-    assert not select("block.bias", nn.Parameter(torch.zeros(2)))
-
-
-def test_complement_inverts_its_selector() -> None:
-    select = complement(matching("head"))
-    assert select("block.weight", _weight())
-    assert not select("lm_head.weight", _weight())
-
-
-def test_selectors_compare_by_value_so_configs_can_be_diffed() -> None:
-    """A closure never equals another; these do, or forks could not be diffed."""
-    assert matching("a", "b") == matching("a", "b")
-    assert matching("a") != matching("b")
-    assert hash(matching("a")) == hash(matching("a"))
-    assert excluding(everything, "x") == excluding(everything, "x")
-    assert excluding(everything, "x") != excluding(everything, "y")
-    assert hash(excluding(everything, "x")) == hash(excluding(everything, "x"))
-    assert complement(everything) == complement(everything)
-    assert complement(everything) != complement(matching("x"))
-    assert hash(complement(everything)) == hash(complement(everything))
-    assert matching("a") != "matching('a')"
-
-
-def test_selector_reprs_name_functions_without_addresses() -> None:
-    assert repr(matching("a", "b")) == "matching('a', 'b')"
-    assert repr(excluding(everything, "head")) == "excluding(everything, 'head')"
-    assert repr(complement(matching("x"))) == "complement(matching('x'))"
-    assert (
-        repr(excluding(Muon.eligible_tensor, "head"))
-        == "excluding(Muon.eligible_tensor, 'head')"
-    )
 
 
 def test_chained_state_iterates_over_every_members_keys() -> None:

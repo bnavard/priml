@@ -1640,17 +1640,6 @@ class SpeedrunDiT(nn.Module):
         """Sparse-dense routing; ``None`` runs every block densely."""
 
         @property
-        def channels_out(self) -> int:
-            """Latent channels emitted by the readout.
-
-            Returns:
-              channels: Equal to ``channels_in``; the model predicts a velocity
-              in the space it consumes.
-
-            """
-            return self.channels_in
-
-        @property
         def channels_cls(self) -> int:
             """Width of the diffused class token.
 
@@ -1720,7 +1709,9 @@ class SpeedrunDiT(nn.Module):
             # a separate decoder width, but no projection sits between them and
             # every published size leaves the two equal.
             self.readout.channels_in = self.channels_hidden
-            self.readout.channels_out = self.patch_size**2 * self.channels_out
+            # A velocity lives in the space it moves, so the readout emits
+            # ``channels_in`` per patch position.
+            self.readout.channels_out = self.patch_size**2 * self.channels_in
             self.readout.cond_dim = self.channels_hidden
             self.readout.channels_cls = self.channels_cls
             propagate_attr(
@@ -1846,7 +1837,7 @@ class SpeedrunDiT(nn.Module):
         super().__init__()
         self.config = config
         self.patch_size = config.patch_size
-        self.channels_out = config.channels_out
+        self.channels_out = config.channels_in
         self.num_patches = config.num_patches
         self.grid = config.image_size // config.patch_size
         self.projector_dims = list(config.projector_dims)

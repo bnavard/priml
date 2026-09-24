@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from typing import Final, cast
 
-from torch import Tensor
+from torch import Tensor, nn
 
 import pytest
 import torch
 
-from priml.baselines.speedrundit.train_step import SpeedrunDiTTrainStep
+from priml.baselines.speedrundit.train_step import (
+    InitialWeightsEMA,
+    SpeedrunDiTTrainStep,
+)
 from priml.train.parallelism import NoParallel
 
 
@@ -178,6 +181,26 @@ def test_the_ema_shadow_trails_the_live_weights() -> None:
         if live[name].requires_grad and not torch.equal(value, live[name])
     ]
     assert moved
+
+
+def test_the_ema_starts_at_the_initial_weights() -> None:
+    """The first update averages toward step one FROM the initial weights.
+
+    Seeded lazily at its first call, the shadow would already read 3.0.
+    """
+    model = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    ema = InitialWeightsEMA.Config(decay=0.5).make()
+    ema.snapshot(model)
+    assert ema.global_step == 0
+    with torch.no_grad():
+        model.weight.fill_(3.0)
+    ema(model)
+    assert ema.shadow_model is not None
+    shadow = cast(nn.Linear, ema.shadow_model)
+    assert torch.equal(shadow.weight, torch.full_like(model.weight, 2.0))
+    assert ema.global_step == 1
 
 
 def test_eval_does_not_update_anything() -> None:

@@ -42,8 +42,8 @@ from priml.optimizers import (
     learning_rate,
     lr_scale,
 )
-from priml.optimizers.composite import complement, excluding
 from priml.optimizers.muon import Muon
+from priml.optimizers.parameter_filter import complement, excluding
 from priml.train.ema import EMA, NoEMA
 from priml.train.train_step import TrainStep
 

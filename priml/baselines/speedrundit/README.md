@@ -131,8 +131,8 @@ One structural difference is **reported rather than normalized away**:
   trainable ones -- the only order any computation reads -- separately.
 
 The EMA matches the reference's `update_ema` bit for bit: `exp000` seeds its
-shadow at construction (`EMA.seed`), as `train.py:225` seeds its copy, and
-averages the frozen `pos_embed` too (`param_filter=all_params`), since the
+shadow at construction (`InitialWeightsEMA`), as `train.py:225` seeds its
+copy, and averages the frozen `pos_embed` too (`select=everything`), since the
 reference's lerp walks every `named_parameter` and `p * 0.9999 + p * 0.0001`
 is not `p` in float32. Autocast wraps the model forward alone with float32
 outputs, as `accelerate.prepare` does, so the objective reduces in float32.

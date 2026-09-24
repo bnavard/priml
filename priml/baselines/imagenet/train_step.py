@@ -30,12 +30,8 @@ import torch
 from priml.baselines.imagenet.model import TorchvisionResNet
 from priml.math.custom_types import TensorFn
 from priml.math.schedules import Schedule, cyclic
-from priml.optimizers import (
-    CompositeOptimizer,
-    apply_lr_scale,
-    complement,
-    matching,
-)
+from priml.optimizers import CompositeOptimizer, apply_lr_scale
+from priml.optimizers.parameter_filter import complement, matching
 from priml.train.train_step import TrainStep
 
 

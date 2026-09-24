@@ -43,7 +43,7 @@ from priml.optimizers import (
     NorMuon,
     apply_lr_scale,
 )
-from priml.optimizers.composite import Selector, excluding, matching
+from priml.optimizers.parameter_filter import ParameterFilter, excluding, matching
 from priml.train.train_step import TrainStep
 
 
@@ -98,7 +98,7 @@ class TokenCrossEntropy:
         }
 
 
-def matrix_parameters() -> Selector:
+def matrix_parameters() -> ParameterFilter:
     """Select the reasoning matrices: rank >= 2, and not a lookup table.
 
     Returns:

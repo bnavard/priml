@@ -3,14 +3,7 @@
 from __future__ import annotations
 
 from priml.optimizers.adam_atan2 import AdamATan2
-from priml.optimizers.composite import (
-    CompositeOptimizer,
-    Selector,
-    complement,
-    everything,
-    excluding,
-    matching,
-)
+from priml.optimizers.composite import CompositeOptimizer
 from priml.optimizers.fused_adamw import FusedAdamW
 from priml.optimizers.lr import (
     HasParamGroups,
@@ -36,16 +29,11 @@ __all__ = [
     "Muon",
     "Newton",
     "NorMuon",
-    "Selector",
     "SignSGD",
     "apply_lr_scale",
     "clip_grad_norm",
-    "complement",
-    "everything",
-    "excluding",
     "learning_rate",
     "lr_scale",
-    "matching",
     "remember_initial_lrs",
     "step_optimizers",
     "zero_optimizers",

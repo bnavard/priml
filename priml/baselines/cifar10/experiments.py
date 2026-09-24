@@ -47,13 +47,9 @@ from priml.baselines.cifar10.train_step import Cifar10TrainStep
 from priml.math.schedules import polynomial
 from priml.metrics.topk import TopK
 from priml.model.init import dirac
-from priml.optimizers import (
-    CompositeOptimizer,
-    Muon,
-    complement,
-    excluding,
-)
+from priml.optimizers import CompositeOptimizer, Muon
 from priml.optimizers.muon import adjust_lr_conv_heuristic
+from priml.optimizers.parameter_filter import complement, excluding
 from priml.runtime import SingleProcess
 from priml.train.train_loop import TrainLoop
 

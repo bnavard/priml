@@ -17,13 +17,8 @@ import torch
 from priml.baselines.cifar10.model import ConvBlock, ResNet, SpeedNet
 from priml.baselines.cifar10.train_step import Cifar10TrainStep
 from priml.math.schedules import cosine, polynomial
-from priml.optimizers import (
-    CompositeOptimizer,
-    Muon,
-    complement,
-    excluding,
-    learning_rate,
-)
+from priml.optimizers import CompositeOptimizer, Muon, learning_rate
+from priml.optimizers.parameter_filter import complement, excluding
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.timer import CheckpointableStepTimer
 from priml.train.custom_types import OptimizerProtocol

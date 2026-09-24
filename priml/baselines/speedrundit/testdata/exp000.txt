@@ -142,7 +142,7 @@ SpeedrunDiTLoop(
                 │       model_quantization=NoModelQuantization.Config(),
                 │       activation_memoization=DefaultActivationStorage.Config(),
                 │       compile=PartialConfig(<class 'functools.partial'>, <function torch.compile at 0xdefacedeface>, fullgraph=True),
-                │       ema=EMA.Config(
+                │       ema=InitialWeightsEMA.Config(
                 │               decay=0.9999,
                 │               update_after_step=0,
                 │               update_every=1,
@@ -150,7 +150,7 @@ SpeedrunDiTLoop(
                 │               shadow_kind='module',
                 │               warmup_seed=False,
                 │               decay_schedule=<function priml.train.ema.constant_decay at 0xdefacedeface>,
-                │               param_filter=<function priml.train.ema.all_params at 0xdefacedeface>
+                │               select=<function priml.optimizers.parameter_filter.everything at 0xdefacedeface>
                 │       ),
                 │       gradient_clip_norm=1.0,
                 │       skip_step_on_nonfinite_grad=False,

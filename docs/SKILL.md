@@ -258,7 +258,7 @@ names its classifier `head`.
 
 A `Config` fixes both: its fields are nodes, so they print and diff, and each is
 a slot a caller can fill. Promotion then also cuts THROUGH the original
-function: routing is general (`composite.py`'s `Selector`, `excluding`,
+function: routing is general (`parameter_filter.py`'s `ParameterFilter`, `excluding`,
 `complement`), `ndim >= 2` is Muon's own claim (`Muon.eligible_tensor`), and
 `excluding(Muon.eligible_tensor, "head")` names a layer, so it stays put.
 

@@ -1,7 +1,9 @@
 """Bit-for-bit goldens for SR-DiT.
 
 These freeze what ``scripts/parity.py`` established against the pinned
-reference, at the parity script's own geometry. The script needs a network and
+reference. ``source_init`` is at the parity script's geometry, since it IS the
+reference's construction; the other two shrink the port further, which the
+reference's hard-coded widths would not allow. The script needs a network and
 a clone and runs once; these run on CPU in the ordinary suite and are what
 catch a regression afterwards.
 
@@ -27,17 +29,16 @@ fails, which is what forces someone to read it first.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast, override
+from typing import Final, cast, override
 
 from torch import Tensor, nn
 
 import pytest
 import torch
 
+from priml.baselines.speedrundit.model import SpeedrunDiT
 from priml.baselines.speedrundit.scripts.parity import (
-    GEOMETRY,
     INIT_GOLDEN,
-    draw_inputs,
     initialized_state,
     native_config,
 )
@@ -47,28 +48,43 @@ from priml.testing.bfb import assert_bfb_against_golden
 from priml.train.parallelism import NoParallel
 
 
-if TYPE_CHECKING:
-    from priml.baselines.speedrundit.model import SpeedrunDiT
-
-
 _CWD: Final = Path(__file__).parent.resolve()
 
 STEPS: Final = 5
+BATCH: Final = 2
+CHANNELS: Final = 1
+GRID: Final = 2
+CLASSES: Final = 3
+TARGET: Final = 2
 
 
 def miniature() -> SpeedrunDiT.Config:
-    """Shrink the recipe to the parity script's geometry, and nothing else.
+    """Shrink the recipe to the smallest model that still takes every path.
 
-    Cut: width, depth, heads, the latent grid, the class count, the projector
-    widths. Kept: the routing ratios, the path-drop probability, the value
-    residual, the rotary positions, the qk norms, the zeroed modulation, and
-    every initialization rule.
+    One block per SPRINT stage, one head of four (the axial rotary ladder's
+    floor), and every other width at two. Kept: the routing ratios, the
+    path-drop probability, the value residual, the rotary positions, the qk
+    norms, the zeroed modulation, and every initialization rule.
 
     Returns:
       cfg: The golden geometry.
 
     """
-    return native_config()
+    cfg = SpeedrunDiT.Config()
+    cfg.channels_in = CHANNELS
+    cfg.channels_hidden = 4
+    cfg.image_size = GRID
+    cfg.num_layers = 3
+    cfg.heads = 1
+    cfg.num_classes = CLASSES
+    cfg.projector_dims = (TARGET,)
+    cfg.projector_hidden = 2
+    cfg.block.ffn.expansion = 2.0
+    cfg.time_embedder.channels_frequency = 4
+    assert cfg.sprint is not None
+    cfg.sprint.num_encoder_layers = 1
+    cfg.sprint.num_decoder_layers = 1
+    return cfg
 
 
 def miniature_step() -> SpeedrunDiTTrainStep.Config:
@@ -99,8 +115,14 @@ def build_input() -> dict[str, Tensor]:
       batch: Latents, times, labels, class features, and alignment targets.
 
     """
-    classes = cast(int, GEOMETRY["num_classes"])
-    return draw_inputs(torch.Generator().manual_seed(0), classes=classes)
+    generator = torch.Generator().manual_seed(0)
+    return {
+        "media": torch.randn(BATCH, CHANNELS, GRID, GRID, generator=generator),
+        "time": torch.rand(BATCH, generator=generator),
+        "label": torch.randint(CLASSES, (BATCH,), generator=generator),
+        "cls_token": torch.randn(BATCH, TARGET, generator=generator),
+        "features": torch.randn(BATCH, 1 + GRID * GRID, TARGET, generator=generator),
+    }
 
 
 class _Forward(nn.Module):
@@ -223,12 +245,12 @@ def test_source_initialization_golden() -> None:
     assert (_CWD / "testdata" / INIT_GOLDEN).is_file(), (
         "Only scripts/parity.py --mint may mint this golden"
     )
-    _assert_initialization(miniature())
+    _assert_initialization(native_config())
 
 
 def test_source_initialization_golden_bites() -> None:
     """A changed initialization constant must fail the comparison."""
-    cfg = miniature()
+    cfg = native_config()
     assert cfg.value_residual is not None
     cfg.value_residual.initial = 0.25
     with pytest.raises(AssertionError, match="value_residual"):

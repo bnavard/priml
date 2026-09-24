@@ -5,14 +5,20 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
-from typing import Literal, NotRequired, TypedDict, cast
+from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 
 import copy
 
 from configgle import Fig
-from torch import Tensor, nn
+from torch import Tensor
 
 import torch
+
+from priml.optimizers.parameter_filter import ParameterFilter, trainable
+
+
+if TYPE_CHECKING:
+    from torch import nn
 
 
 class NoEMA:
@@ -73,44 +79,6 @@ class NoEMA:
         state = cast(NoEMA.StateDict, state_dict)
         self.global_step = state["global_step"]
         self.local_step = state.get("local_step", 0)
-
-
-type ParamFilter = Callable[[str, nn.Parameter], bool]
-"""Decides from ``(name, param)`` whether a parameter is averaged."""
-
-
-def trainable_params(name: str, param: nn.Parameter) -> bool:
-    """Average the parameters an optimizer moves.
-
-    Args:
-      name: Parameter name.
-      param: The parameter.
-
-    Returns:
-      tracked: Whether ``param`` requires a gradient.
-
-    """
-    del name
-    return param.requires_grad
-
-
-def all_params(name: str, param: nn.Parameter) -> bool:
-    """Average every parameter, frozen ones included.
-
-    A frozen tensor still drifts under the lerp, since ``p * d + p * (1 - d)``
-    rounds; a recipe reproducing one that averages every ``named_parameter``
-    needs that drift.
-
-    Args:
-      name: Parameter name.
-      param: The parameter.
-
-    Returns:
-      tracked: Always True.
-
-    """
-    del name, param
-    return True
 
 
 type DecaySchedule = Callable[[float, int], float]
@@ -197,9 +165,9 @@ class EMA:
       shadow updated in ``__call__``. The in-place ``apply_to`` swap NEVER
       swaps buffers regardless of ``track_buffers`` -- it targets weight
       averaging only, leaving live-model buffers in place.
-    - ``param_filter``: ``(name, param) -> bool`` predicate choosing which
-      params the shadow averages. :func:`trainable_params` (default) takes
-      those requiring a gradient; :func:`all_params` takes every one.
+    - ``select``: a :class:`~priml.optimizers.parameter_filter.ParameterFilter`
+      choosing which params the shadow averages -- ``trainable`` (default)
+      or ``everything``, which also takes frozen ones.
     - ``decay`` / ``update_after_step`` / ``update_every``: the usual
       lerp schedule controls.
     - ``warmup_seed``: copy live weights into the shadow at the warmup
@@ -207,8 +175,6 @@ class EMA:
     - ``decay_schedule``: a ``(decay, step) -> decay`` function.
       :func:`constant_decay` (default) ignores the step;
       :func:`karras_decay` ramps it in so early averaging is faster.
-    - :meth:`seed`: initialize the shadow before the first update rather than
-      lazily at it.
 
     Example::
 
@@ -259,11 +225,11 @@ class EMA:
 
         :func:`karras_decay` ramps it in; any ``(float, int) -> float`` works."""
 
-        param_filter: ParamFilter = trainable_params
+        select: ParameterFilter = trainable
         """Chooses which parameters the shadow averages.
 
-        :func:`all_params` also averages frozen ones; any
-        ``(name, param) -> bool`` works."""
+        A frozen tensor still drifts under the lerp, since
+        ``p * d + p * (1 - d)`` rounds, so ``everything`` is not the default."""
 
     def __init__(self, config: Config) -> None:
         """Initialize EMA.
@@ -292,7 +258,7 @@ class EMA:
         self.shadow_kind = config.shadow_kind
         self.warmup_seed = config.warmup_seed
         self.decay_schedule = config.decay_schedule
-        self.param_filter = config.param_filter
+        self.select = config.select
 
         self.shadow_model: nn.Module | None = None
         self.shadow_params: dict[str, Tensor] = {}
@@ -331,24 +297,6 @@ class EMA:
                 "effective decay must lie in [0, 1].",
             )
         return decay
-
-    def seed(self, model: nn.Module) -> None:
-        """Initialize the shadow from ``model`` now, without an update.
-
-        For a recipe whose shadow starts at the initial weights: without this,
-        the first ``__call__`` seeds from weights one optimizer step later.
-        Advances no counter.
-
-        Args:
-          model: Live model providing the initial parameters.
-
-        Raises:
-          RuntimeError: The shadow is already initialized.
-
-        """
-        if self._initialized:
-            raise RuntimeError("EMA.seed(): the shadow is already initialized.")
-        self._lazy_initialize(model)
 
     def __call__(self, model: nn.Module) -> None:
         """Advance one EMA step.
@@ -544,9 +492,7 @@ class EMA:
 
     def _lazy_initialize(self, model: nn.Module) -> None:
         self._tracked_names = {
-            name
-            for name, param in model.named_parameters()
-            if self.param_filter(name, param)
+            name for name, param in model.named_parameters() if self.select(name, param)
         }
         if self.shadow_kind == "module":
             self.shadow_model = copy.deepcopy(model)
