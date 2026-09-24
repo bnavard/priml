@@ -64,6 +64,7 @@ __all__ = [
     "SpeedrunDiTLoss",
     "TimeSamplerFn",
     "TimeTransformFn",
+    "VelocityField",
     "as_callable",
     "cosine_path",
     "linear_path",
@@ -135,6 +136,32 @@ class TimeTransformFn(Protocol):
 
         Returns:
           t: Transformed times, still in ``[0, 1]``.
+
+        """
+        ...
+
+
+class VelocityField(Protocol):
+    """Predicts both streams' velocities; the model, or a wrapper around it."""
+
+    def __call__(
+        self,
+        media: Tensor,
+        time: Tensor,
+        label: Tensor,
+        cls_token: Tensor,
+        /,
+    ) -> SpeedrunDiT.Output:
+        """Predict velocities at one time.
+
+        Args:
+          media: Noised latents.
+          time: Flow times, ``[batch]``.
+          label: Class indices.
+          cls_token: Noised class token.
+
+        Returns:
+          output: Velocities and alignment projections.
 
         """
         ...
@@ -439,7 +466,7 @@ class SpeedrunDiTLoss:
 
     def __call__(
         self,
-        model: SpeedrunDiT,
+        model: VelocityField,
         *,
         media: Tensor,
         label: Tensor,

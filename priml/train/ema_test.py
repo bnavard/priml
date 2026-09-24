@@ -235,6 +235,59 @@ def test_ema_param_filter_excludes_matching_params() -> None:
     assert diff > 0.0, "param_filter did not exclude layer 1"
 
 
+# -- seed / track_frozen ------------------------------------------------------
+
+
+def test_ema_seed_starts_the_shadow_at_the_initial_weights() -> None:
+    """The first update averages toward the step-1 weights from the initial ones."""
+    model = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    ema = EMA.Config(decay=0.5).make()
+    ema.seed(model)
+    assert ema.shadow_model is not None
+    assert ema.global_step == 0
+    with torch.no_grad():
+        model.weight.fill_(3.0)
+    ema(model)
+    shadow = cast(nn.Linear, ema.shadow_model)
+    # Lazily seeded at the first call, the shadow would read 3.0 here.
+    assert torch.equal(shadow.weight, torch.full_like(model.weight, 2.0))
+    assert ema.global_step == 1
+
+
+def test_ema_seed_twice_raises() -> None:
+    model = nn.Linear(1, 1)
+    ema = EMA.Config().make()
+    ema.seed(model)
+    with pytest.raises(RuntimeError, match="already initialized"):
+        ema.seed(model)
+
+
+def test_ema_track_frozen_averages_frozen_parameters() -> None:
+    """A frozen parameter is averaged, and so drifts by rounding, when tracked."""
+    model = nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    model.weight.requires_grad_(False)
+    tracked = EMA.Config(decay=0.5, track_frozen=True).make()
+    skipped = EMA.Config(decay=0.5).make()
+    for ema in (tracked, skipped):
+        ema.seed(model)
+    # Moved by hand: nothing trains a frozen parameter, but a recipe that
+    # averages every ``named_parameter`` still lerps toward its live value.
+    with torch.no_grad():
+        model.weight.fill_(3.0)
+    for ema in (tracked, skipped):
+        ema(model)
+    assert tracked.shadow_model is not None
+    assert skipped.shadow_model is not None
+    averaged = dict(tracked.shadow_model.named_parameters())["weight"]
+    untouched = dict(skipped.shadow_model.named_parameters())["weight"]
+    assert torch.equal(averaged, torch.full_like(model.weight, 2.0))
+    assert torch.equal(untouched, torch.full_like(model.weight, 1.0))
+
+
 # -- state_dict independence (REAL-6 carryover) -------------------------------
 
 

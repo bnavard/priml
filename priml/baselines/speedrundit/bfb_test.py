@@ -16,7 +16,10 @@ noticing when the recipe moved.
 
 ``forward`` and ``five_steps`` go through the harness, which randomizes the
 parameters and LOADS them on replay; that is why initialization cannot be one
-of them, since the load overwrites exactly what construction produced.
+of them, since the load overwrites exactly what construction produced. It is
+also why ``five_steps`` cannot see the EMA's construction-time seed, which
+predates the load: ``scripts/parity.py`` is what compares that, against the
+reference's own ``update_ema``.
 Regenerate those two with ``BFB_REGENERATE=1``; a missing one is minted AND
 fails, which is what forces someone to read it first.
 """
@@ -192,9 +195,13 @@ class _FiveSteps(nn.Module):
             assert isinstance(loss, Tensor)
             pieces.append(loss.float().reshape(1))
         # The shadow lives on the step, which is not a module, so no state
-        # the harness compares would otherwise reach it.
+        # the harness compares would otherwise reach it. Cloned INSIDE the
+        # swap: a lazy generator read after the context exits sees the
+        # restored live weights instead of the shadow.
         with self.step.ema.apply_to(self.inner):
-            pieces.extend(p.detach().float().flatten() for p in self.inner.parameters())
+            pieces.extend(
+                [p.detach().float().flatten().clone() for p in self.inner.parameters()],
+            )
         return torch.cat(pieces)
 
 

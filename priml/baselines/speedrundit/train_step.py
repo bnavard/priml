@@ -3,16 +3,16 @@
 The recipe drives the update itself rather than calling the inherited
 :meth:`TrainStep.step`, for one reason: the objective returns six named terms
 and the step publishes each of them, so the loss cannot go through the base's
-single-tensor ``loss`` slot. Everything else the base owns -- the optimizer,
-the gradient clip, the EMA, the autocast policy, the step counter -- is used as
-it stands, and the ``with self.timer_step:`` bracket is what advances
-``global_step`` so every cadence above still means what it says.
+single-tensor ``loss`` slot. The optimizer, the EMA, and the step counter are
+the base's; the gradient clip is called here, between backward and the timed
+update. The ``with self.timer_step:`` bracket is what advances ``global_step``
+so every cadence above still means what it says.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from dataclasses import field
 from typing import TYPE_CHECKING, cast, override
 
@@ -30,8 +30,6 @@ from priml.train.train_step import TrainStep
 
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
-
     from priml.train.custom_types import TrainStepOutput
 
 
@@ -78,12 +76,22 @@ class SpeedrunDiTTrainStep(TrainStep):
                 update_after_step=0,
                 track_buffers=False,
                 shadow_kind="module",
+                track_frozen=True,
             ),
         )
-        """Weight-averaging shadow, updated after each optimizer step."""
+        """Weight-averaging shadow, seeded at construction and updated after
+        each optimizer step.
+
+        Seeded from the initial weights, as the reference seeds its copy
+        (``train.py:225``), and averaging the frozen position table too, as the
+        reference's ``update_ema`` walks every ``named_parameter``."""
 
         dtype_autocast: torch.dtype | None = torch.bfloat16
-        """Autocast dtype for the forward; ``None`` runs in full precision."""
+        """Autocast dtype for the model forward; ``None`` runs in full precision.
+
+        The forward alone, with its outputs cast back to float32: the
+        objective's arithmetic stays float32, as ``accelerate.prepare`` leaves
+        it in the reference."""
 
         # ---- This recipe's own. ----
 
@@ -101,6 +109,8 @@ class SpeedrunDiTTrainStep(TrainStep):
         super().__init__(config)
         self.config: SpeedrunDiTTrainStep.Config = config
         self.objective = config.objective.make()
+        if isinstance(self.ema, EMA):
+            self.ema.seed(self.model)
 
     @property
     @override
@@ -127,8 +137,7 @@ class SpeedrunDiTTrainStep(TrainStep):
 
         """
         self.model.train()
-        with self._autocast():
-            result = self._evaluate(batch)
+        result = self._evaluate(batch)
         result.loss.backward()
         # Clipped outside the timer bracket: the bracket is what advances
         # ``global_step``, and the clip is not part of the update it counts.
@@ -165,11 +174,7 @@ class SpeedrunDiTTrainStep(TrainStep):
         was_training = self.model.training
         self.model.eval()
         try:
-            with (
-                torch.inference_mode(),
-                self.ema.apply_to(self.model),
-                self._autocast(),
-            ):
+            with torch.inference_mode(), self.ema.apply_to(self.model):
                 result = self._evaluate(batch)
         finally:
             self.model.train(was_training)
@@ -179,29 +184,37 @@ class SpeedrunDiTTrainStep(TrainStep):
             "metrics": _metrics(result),
         }
 
-    @contextmanager
-    def _autocast(self) -> Generator[None]:
-        """Enter autocast when the recipe asks for it.
+    def _forward(
+        self,
+        media: Tensor,
+        time: Tensor,
+        label: Tensor,
+        cls_token: Tensor,
+        /,
+    ) -> SpeedrunDiT.Output:
+        """Run the model under autocast and return float32 outputs.
 
-        The base builds this inline inside ``__call__`` and ``call_eval``,
-        neither of which this recipe uses: the objective drives the model
-        itself, so the context has to be opened here.
-
-        Yields:
-          None: With autocast active, or nothing when it is disabled.
-
+        The base's autocast wraps the whole loss; this recipe's reference
+        casts only the forward, so the objective reduces in float32. Wrapping
+        the objective instead measured different gradients at step one.
         """
         dtype = self.config.dtype_autocast
-        if dtype is None:
-            with nullcontext():
-                yield
-            return
-        with torch.amp.autocast(
-            device_type=self.device.type,
-            dtype=dtype,
-            cache_enabled=self.config.autocast_cache_enabled,
-        ):
-            yield
+        context = (
+            nullcontext()
+            if dtype is None
+            else torch.amp.autocast(
+                device_type=self.device.type,
+                dtype=dtype,
+                cache_enabled=self.config.autocast_cache_enabled,
+            )
+        )
+        with context:
+            out = self.model(media, time, label, cls_token)
+        return SpeedrunDiT.Output(
+            velocity=out.velocity.float(),
+            projections=[p.float() for p in out.projections],
+            cls_velocity=out.cls_velocity.float(),
+        )
 
     def _evaluate(self, batch: dict[str, object]) -> SpeedrunDiTLoss.Output:
         """Run the objective over one batch.
@@ -222,7 +235,7 @@ class SpeedrunDiTTrainStep(TrainStep):
         assert isinstance(cls_token, Tensor)
         assert isinstance(features, list)
         return self.objective(
-            self.model,
+            self._forward,
             media=media,
             label=label,
             cls_token=cls_token,

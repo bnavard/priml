@@ -7,9 +7,9 @@ Measure this port against the pinned upstream SpeedrunDiT, bit for bit.
 
 Clones the reference at a pinned commit, imports it UNMODIFIED, and compares
 with exact tensor equality inside Priml's host-agnostic numeric context: the
-loader, initialization, five optimizer steps (times, noise, losses, every
-gradient, every weight), an eval forward with and without the sparse path, and
-the guided sampler.
+loader, initialization, five optimizer steps of exp000's own train step (times,
+noise, losses, every gradient, every weight, the EMA shadow), an eval forward
+with and without the sparse path, and the guided sampler.
 
 Nothing here is a unit test. It needs a network, a git clone, and a minute,
 and it establishes the port ONCE against a moving upstream; the bit-for-bit
@@ -21,8 +21,8 @@ it for its own duration.
 The comparison is deliberately one-substitution: both sides run the same
 geometry, the same seed, and the same input tensors, and neither is adjusted
 to make the other agree. Where a difference is structural rather than
-numerical -- parameter names, and Priml's EMA declining to average frozen
-tensors -- it is REPORTED under its own heading rather than normalized away.
+numerical -- parameter names -- it is REPORTED under its own heading rather
+than normalized away.
 
 Examples:
   uv --quiet run --frozen --with timm python -m priml.baselines.speedrundit.scripts.parity  # noqa: E501
@@ -33,11 +33,13 @@ Examples:
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Final, Protocol, TypedDict, cast, override
 
 import argparse
+import ast
 import copy
 import importlib
 import json
@@ -52,16 +54,21 @@ import numpy as np
 import torch
 
 from priml.baselines.speedrundit.data import SpeedrunDiTData
+from priml.baselines.speedrundit.experiments import exp000
 from priml.baselines.speedrundit.loss import SpeedrunDiTLoss
 from priml.baselines.speedrundit.model import SpeedrunDiT
 from priml.baselines.speedrundit.sampler import EulerMaruyamaSampler
+from priml.baselines.speedrundit.train_step import SpeedrunDiTTrainStep
 from priml.testing.bfb import host_agnostic_numerics
+from priml.train.parallelism import NoParallel
 
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Sequence
 
     from torch.utils.data import Dataset
+
+    from priml.baselines.speedrundit.loss import VelocityField
 
 
 SOURCE_URL: Final = "https://github.com/SwayStar123/SpeedrunDiT.git"
@@ -159,6 +166,20 @@ class _Trace(TypedDict):
     noise: Tensor
     grads: list[tuple[str, Tensor]]
     weights: list[tuple[str, Tensor]]
+    ema: list[tuple[str, Tensor]]
+
+
+class _UpdateEma(Protocol):
+    """The reference's ``train.update_ema``."""
+
+    def __call__(
+        self,
+        ema_model: nn.Module,
+        model: nn.Module,
+        decay: float = ...,
+    ) -> None:
+        """Apply to the input."""
+        ...
 
 
 def upstream_module(name: str) -> _ReferenceModules:
@@ -515,20 +536,55 @@ def build_batches(count: int) -> list[dict[str, Tensor]]:
     return [draw_inputs(generator, classes=classes) for _ in range(count)]
 
 
+def upstream_update_ema(upstream: Path) -> _UpdateEma:
+    """Bind the reference's ``update_ema`` from ``train.py``'s own source.
+
+    ``train.py`` is a script that imports wandb, accelerate, and its encoders at
+    module scope, so the function is executed alone rather than imported; the
+    text run is theirs, not a retyping.
+
+    Args:
+      upstream: Reference checkout.
+
+    Returns:
+      update_ema: The reference's EMA step.
+
+    """
+    path = upstream / "train.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    node = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "update_ema"
+    )
+    namespace: dict[str, object] = {"torch": torch, "OrderedDict": OrderedDict}
+    exec(compile(ast.Module([node], []), str(path), "exec"), namespace)  # noqa: S102 -- Executes one function from the pinned reference checkout.
+    return cast(_UpdateEma, namespace["update_ema"])
+
+
 def run_upstream(
     model: nn.Module,
     batches: Sequence[dict[str, Tensor]],
+    *,
+    update_ema: _UpdateEma,
 ) -> list[_Trace]:
     """Drive the reference for :data:`STEPS` optimizer steps.
+
+    Mirrors ``train.py``'s loop: its EMA is seeded from the initial weights
+    (``update_ema(ema, model, decay=0)``) and stepped after every update.
 
     Args:
       model: The reference model.
       batches: Fixed inputs.
+      update_ema: The reference's own EMA step.
 
     Returns:
-      trace: Per-step losses, gradients, and post-step weights.
+      trace: Per-step losses, gradients, post-step weights, and EMA shadow.
 
     """
+    ema = copy.deepcopy(model)
+    ema.requires_grad_(False)
+    update_ema(ema, model, decay=0)
     objective = upstream_module("loss").SILoss(
         path_type="linear",
         weighting="uniform",
@@ -557,81 +613,161 @@ def run_upstream(
             denoise.mean() + 0.5 * proj.mean() + 0.03 * cls.mean() + 0.05 * cfm.mean()
         )
         loss.backward()
+        _ = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # After the clip, where the optimizer consumes them -- the same point
+        # the port side reads its own.
         grads = [
             (name, p.grad.detach().clone())
             for name, p in model.named_parameters()
             if p.grad is not None
         ]
-        _ = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        update_ema(ema, model)
         trace.append(
             {
                 "loss": loss.detach().clone(),
                 "time": time.detach().clone(),
                 "noise": noise.detach().clone(),
                 "grads": grads,
-                "weights": [
-                    (n, p.detach().clone()) for n, p in model.named_parameters()
-                ],
+                "weights": _named(model),
+                "ema": _named(ema),
             },
         )
     return trace
 
 
-def run_native(
-    model: SpeedrunDiT,
-    batches: Sequence[dict[str, Tensor]],
-) -> list[_Trace]:
-    """Drive the port for :data:`STEPS` optimizer steps.
+def native_step(seed: int) -> SpeedrunDiTTrainStep:
+    """Build exp000's own train step under the seed the reference was built at.
+
+    The step constructs its model itself, so its initialization, its optimizer,
+    and its EMA seeding are all what exp000 does -- nothing is copied in after
+    the fact to paper over a difference. Autocast and compile are off: the
+    reference side runs fp32.
 
     Args:
-      model: The ported model.
+      seed: Global seed the reference's construction started from.
+
+    Returns:
+      step: exp000's train step at the parity geometry.
+
+    """
+    cfg = exp000().step
+    cfg.model = native_config()
+    cfg.parallelism = NoParallel.Config(device="cpu")
+    cfg.dtype_autocast = None
+    cfg.compile = None
+    torch.manual_seed(seed)
+    step = cfg.make()
+    assert isinstance(step, SpeedrunDiTTrainStep)
+    return step
+
+
+def run_native(
+    step: SpeedrunDiTTrainStep,
+    batches: Sequence[dict[str, Tensor]],
+) -> list[_Trace]:
+    """Drive exp000's train step for :data:`STEPS` optimizer steps.
+
+    Args:
+      step: exp000's train step, from :func:`native_step`.
       batches: Fixed inputs.
 
     Returns:
-      trace: Per-step losses, gradients, and post-step weights.
+      trace: Per-step losses, gradients, post-step weights, and EMA shadow.
 
     """
-    objective = SpeedrunDiTLoss.Config().make()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=1e-4,
-        betas=(0.9, 0.999),
-        weight_decay=0.0,
-        eps=1e-8,
-    )
-    model.train()
+    model = step.model
+    probe = _StepProbe(step)
     trace: list[_Trace] = []
     for batch in batches:
-        result = objective(
-            model,
+        _ = step.train_step(
             media=batch["media"],
             label=batch["label"],
             cls_token=batch["cls_token"],
             features=[batch["features"]],
         )
-        result.loss.backward()
-        grads = [
-            (name, p.grad.detach().clone())
-            for name, p in model.named_parameters()
-            if p.grad is not None
-        ]
-        _ = nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        result = probe.result
+        shadow = step.ema.shadow_model
+        assert shadow is not None
         trace.append(
             {
                 "loss": result.loss.detach().clone(),
                 "time": result.time.detach().clone(),
                 "noise": result.noise.detach().clone(),
-                "grads": grads,
-                "weights": [
-                    (n, p.detach().clone()) for n, p in model.named_parameters()
-                ],
+                "grads": probe.grads,
+                "weights": _named(model),
+                "ema": _named(shadow),
             },
         )
     return trace
+
+
+class _StepProbe:
+    """Records what a train step consumed, from inside it.
+
+    The objective's output and the gradients the optimizer steps on are both
+    gone by the time ``train_step`` returns -- it zeroes the gradients -- so
+    each is read at the call that consumes it: the objective through a
+    forward hook on the model it drives, the gradients through the
+    optimizer's own step pre-hook.
+    """
+
+    def __init__(self, step: SpeedrunDiTTrainStep) -> None:
+        self._model = step.model
+        self._objective = step.objective
+        self.result: SpeedrunDiTLoss.Output
+        self.grads: list[tuple[str, Tensor]] = []
+        step.objective = _RecordingObjective(self)
+        optimizer = step.optimizer
+        assert isinstance(optimizer, torch.optim.Optimizer)
+        _ = optimizer.register_step_pre_hook(self._capture)
+
+    def _capture(self, optimizer: object, args: object, kwargs: object) -> None:
+        del optimizer, args, kwargs
+        self.grads = [
+            (name, p.grad.detach().clone())
+            for name, p in self._model.named_parameters()
+            if p.grad is not None
+        ]
+
+
+class _RecordingObjective(SpeedrunDiTLoss):
+    """The step's objective, keeping its last output on the probe."""
+
+    def __init__(self, probe: _StepProbe) -> None:
+        super().__init__(probe._objective.config)  # noqa: SLF001 -- The probe owns the wrapped objective.
+        self._probe = probe
+
+    @override
+    def __call__(
+        self,
+        model: VelocityField,
+        *,
+        media: Tensor,
+        label: Tensor,
+        cls_token: Tensor,
+        features: Sequence[Tensor] = (),
+        time: Tensor | None = None,
+        noise: Tensor | None = None,
+        noise_cls: Tensor | None = None,
+    ) -> SpeedrunDiTLoss.Output:
+        self._probe.result = super().__call__(
+            model,
+            media=media,
+            label=label,
+            cls_token=cls_token,
+            features=features,
+            time=time,
+            noise=noise,
+            noise_cls=noise_cls,
+        )
+        return self._probe.result
+
+
+def _named(model: nn.Module) -> list[tuple[str, Tensor]]:
+    """Snapshot every named parameter."""
+    return [(n, p.detach().clone()) for n, p in model.named_parameters()]
 
 
 def compare_forward(reference: nn.Module, candidate: SpeedrunDiT) -> bool:
@@ -815,19 +951,30 @@ def main() -> int:
         )
 
         batches = build_batches(STEPS)
-        print(f"{STEPS} training steps")
+        print(f"{STEPS} training steps, exp000's train step")
+        step = native_step(seed=1234)
+        ok &= compare_named(
+            list(reference.named_parameters()),
+            list(step.model.named_parameters()),
+            "train step's own initialization",
+        )
         torch.manual_seed(777)
         with host_agnostic_numerics():
-            left = run_upstream(reference, batches)
+            left = run_upstream(
+                reference,
+                batches,
+                update_ema=upstream_update_ema(upstream),
+            )
         torch.manual_seed(777)
         with host_agnostic_numerics():
-            right = run_native(candidate, batches)
+            right = run_native(step, batches)
 
         for index, (a, b) in enumerate(zip(left, right, strict=True), start=1):
             for key in ("time", "noise", "loss"):
                 ok &= report(f"step {index} {key}", *tensors_equal(a[key], b[key]))
             ok &= compare_named(a["grads"], b["grads"], f"step {index} gradients")
             ok &= compare_named(a["weights"], b["weights"], f"step {index} weights")
+            ok &= compare_named(a["ema"], b["ema"], f"step {index} EMA shadow")
 
         perturb(reference_eval, candidate_eval)
         with host_agnostic_numerics():
@@ -835,13 +982,10 @@ def main() -> int:
             ok &= compare_sampler()
 
     print()
-    print("known structural differences, not normalized away:")
+    print("known structural difference, not normalized away:")
     print("  - parameter names differ (see RENAMES), and the root's frozen")
     print("    pos_embed enumerates before the mask token rather than after;")
     print("    tensors are compared by name, trainable order separately.")
-    print("  - Priml's EMA declines to average frozen tensors, so the shadow")
-    print("    of pos_embed does not drift as the reference's does. The model")
-    print("    weights above are unaffected; the EMA shadow is not compared.")
     print()
     print("PARITY HOLDS" if ok else "PARITY BROKEN")
     return 0 if ok else 1

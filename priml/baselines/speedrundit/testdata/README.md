@@ -10,7 +10,7 @@ one is.
 | `exp000.txt` | `experiments_test.py`, via `configgle.testing.assert_pprint_golden` | The finalized configuration tree of `exp000`, with defaults shown |
 | `source_init.pt` | `scripts/parity.py --mint`, from the pinned reference itself | Every initialized tensor and the RNG state construction leaves, under the port's state names |
 | `speedrundit_forward.pt` | `bfb_test.py::test_forward_bfb` | The op order of one eval forward |
-| `speedrundit_five_steps.pt` | `bfb_test.py::test_five_steps_bfb` | The recipe, driven through `SpeedrunDiTTrainStep`: objective, draws, clip, AdamW moments, and the EMA shadow |
+| `speedrundit_five_steps.pt` | `bfb_test.py::test_five_steps_bfb` | The recipe, driven through `SpeedrunDiTTrainStep`: objective, draws, clip, AdamW moments, and the EMA shadow's averaging (its construction-time seed is compared by `scripts/parity.py`) |
 
 The three `.pt` goldens share the parity script's geometry -- width 16, five
 layers, two heads, a 4x4 grid of three latent channels, batch three -- which

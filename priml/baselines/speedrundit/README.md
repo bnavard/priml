@@ -70,7 +70,7 @@ upstream; the goldens under `testdata/` freeze it afterwards and run on CPU in
 the ordinary suite. Its geometry is the goldens' geometry, so what they freeze
 is what it compared.
 
-Two structural differences are **reported rather than normalized away**:
+One structural difference is **reported rather than normalized away**:
 
 - State names differ (`parity.RENAMES` maps them), and the reference's root
   owns `mask_token` beside `pos_embed` where the port keeps the mask token with
@@ -78,11 +78,18 @@ Two structural differences are **reported rather than normalized away**:
   parameters first, so the frozen table enumerates on the other side of the
   mask token; tensors are therefore compared by name, and the order of the
   trainable ones -- the only order any computation reads -- separately.
-- Priml's `EMA` declines to average tensors with `requires_grad=False`
-  (`priml/train/ema.py:502`), while the reference's `update_ema` walks every
-  `named_parameter` and therefore lerps the frozen `pos_embed` — and
-  `p * 0.9999 + p * 0.0001` is not `p` in float32, so its shadow drifts by
-  rounding. Model weights are unaffected; the EMA shadow is not compared.
+
+The EMA matches the reference's `update_ema` bit for bit: `exp000` seeds its
+shadow at construction (`EMA.seed`), as `train.py:225` seeds its copy, and
+averages the frozen `pos_embed` too (`track_frozen=True`), since the
+reference's lerp walks every `named_parameter` and `p * 0.9999 + p * 0.0001`
+is not `p` in float32. Autocast wraps the model forward alone with float32
+outputs, as `accelerate.prepare` does, so the objective reduces in float32.
+
+Batch order is the one recipe difference parity does not cover: the reference
+shuffles with `DataLoader(shuffle=True)`, drawing from the global torch stream,
+while `SpeedrunDiTData` replays a salted per-pass permutation so a resumed run
+can rebuild its pass.
 
 ### What is shared, and what is not
 

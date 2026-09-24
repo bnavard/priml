@@ -176,6 +176,9 @@ class EMA:
     - ``decay_schedule``: a ``(decay, step) -> decay`` function.
       :func:`constant_decay` (default) ignores the step;
       :func:`karras_decay` ramps it in so early averaging is faster.
+    - ``track_frozen``: also average ``requires_grad=False`` parameters.
+    - :meth:`seed`: initialize the shadow before the first update rather than
+      lazily at it.
 
     Example::
 
@@ -226,6 +229,12 @@ class EMA:
 
         :func:`karras_decay` ramps it in; any ``(float, int) -> float`` works."""
 
+        track_frozen: bool = False
+        """Also average parameters with ``requires_grad=False``.
+
+        A frozen tensor still drifts under the lerp, since ``p * d + p * (1 - d)``
+        rounds; a recipe that averages every ``named_parameter`` needs this."""
+
     def __init__(self, config: Config) -> None:
         """Initialize EMA.
 
@@ -253,6 +262,7 @@ class EMA:
         self.shadow_kind = config.shadow_kind
         self.warmup_seed = config.warmup_seed
         self.decay_schedule = config.decay_schedule
+        self.track_frozen = config.track_frozen
         self._param_filter: _ParamFilter | None = None
 
         self.shadow_model: nn.Module | None = None
@@ -311,6 +321,24 @@ class EMA:
                 "effective decay must lie in [0, 1].",
             )
         return decay
+
+    def seed(self, model: nn.Module) -> None:
+        """Initialize the shadow from ``model`` now, without an update.
+
+        For a recipe whose shadow starts at the initial weights: without this,
+        the first ``__call__`` seeds from weights one optimizer step later.
+        Advances no counter.
+
+        Args:
+          model: Live model providing the initial parameters.
+
+        Raises:
+          RuntimeError: The shadow is already initialized.
+
+        """
+        if self._initialized:
+            raise RuntimeError("EMA.seed(): the shadow is already initialized.")
+        self._lazy_initialize(model)
 
     def __call__(self, model: nn.Module) -> None:
         """Advance one EMA step.
@@ -499,7 +527,7 @@ class EMA:
     # -- Helpers --------------------------------------------------------------
 
     def _should_track(self, name: str, param: nn.Parameter) -> bool:
-        if not param.requires_grad:
+        if not (param.requires_grad or self.track_frozen):
             return False
         if self._param_filter is None:
             return True
